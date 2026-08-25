@@ -49,6 +49,8 @@ pub struct CleanContext<'gctx> {
 
 /// Cleans various caches.
 pub fn clean(ws: &Workspace<'_>, opts: &CleanOptions<'_>) -> CargoResult<()> {
+    ws.gctx()
+        .prepare_workspace_artifacts(ws.root_manifest(), &ws.target_dir(), &ws.build_dir())?;
     let mut target_dir = ws.target_dir();
     let mut build_dir = ws.build_dir();
     let gctx = opts.gctx;
@@ -151,6 +153,13 @@ pub fn clean(ws: &Workspace<'_>, opts: &CleanOptions<'_>) -> CargoResult<()> {
     }
 
     clean_ctx.display_summary()?;
+    if !opts.dry_run {
+        ws.gctx().persist_workspace_artifacts(
+            ws.root_manifest(),
+            &ws.target_dir(),
+            &ws.build_dir(),
+        )?;
+    }
     Ok(())
 }
 

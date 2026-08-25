@@ -1,5 +1,6 @@
 //! Access to a HTTP-based crate registry. See [`HttpRegistry`] for details.
 
+use crate::artifact_storage::DependencyCache;
 use crate::sources::registry::LoadResponse;
 use crate::sources::registry::MaybeLock;
 use crate::sources::registry::RegistryConfig;
@@ -70,6 +71,7 @@ pub struct HttpRegistry<'gctx> {
 
     /// Cached registry configuration.
     registry_config: Mutex<Option<RegistryConfig>>,
+    prepared: Cell<bool>,
 
     /// Backend used for making network requests.
     inner: HttpBackend<'gctx>,
@@ -88,6 +90,7 @@ impl<'gctx> HttpRegistry<'gctx> {
         Ok(HttpRegistry {
             name: name.into(),
             registry_config: Mutex::new(None),
+            prepared: Cell::new(false),
             inner: HttpBackend::new(source_id, gctx, name)?,
         })
     }
@@ -120,6 +123,7 @@ impl<'gctx> HttpRegistry<'gctx> {
     }
 
     async fn config_opt_inner(&self) -> CargoResult<Option<RegistryConfig>> {
+        self.prepare()?;
         debug!("loading config");
         let index_path = self.assert_index_locked(&self.inner().index_cache_path);
         let config_json_path = index_path.join(RegistryConfig::NAME);
@@ -167,6 +171,7 @@ impl<'gctx> HttpRegistry<'gctx> {
                         tracing::debug!("failed to write config.json cache: {}", e);
                     }
                 }
+                self.persist()?;
                 Ok(config)
             }
             LoadResponse::NotFound => Ok(None),
@@ -237,6 +242,15 @@ impl<'gctx> HttpRegistry<'gctx> {
 #[async_trait::async_trait(?Send)]
 impl<'gctx> RegistryData for HttpRegistry<'gctx> {
     fn prepare(&self) -> CargoResult<()> {
+        if !self.prepared.get() {
+            self.inner().gctx.prepare_dependency_artifacts(
+                DependencyCache::RegistryIndex,
+                &self.name,
+                &self.inner().index_cache_path,
+            )?;
+            self.persist()?;
+            self.prepared.set(true);
+        }
         self.inner()
             .gctx
             .deferred_global_last_use()?
@@ -244,6 +258,14 @@ impl<'gctx> RegistryData for HttpRegistry<'gctx> {
                 encoded_registry_name: self.name,
             });
         Ok(())
+    }
+
+    fn persist(&self) -> CargoResult<()> {
+        self.inner().gctx.persist_dependency_artifacts(
+            DependencyCache::RegistryIndex,
+            &self.name,
+            &self.inner().index_cache_path,
+        )
     }
 
     fn index_path(&self) -> &Filesystem {
@@ -331,7 +353,12 @@ impl<'gctx> RegistryData for HttpRegistry<'gctx> {
     }
 
     fn is_crate_downloaded(&self, pkg: PackageId) -> bool {
-        download::is_crate_downloaded(&self.inner().crate_cache_path, &self.inner().gctx, pkg)
+        download::is_crate_downloaded(
+            &self.inner().crate_cache_path,
+            &self.inner().gctx,
+            self.name,
+            pkg,
+        )
     }
 }
 
@@ -402,7 +429,7 @@ impl<'gctx> HttpBackend<'gctx> {
         let index_cache_path = gctx.registry_index_path().join(name);
         Ok(HttpBackend {
             index_cache_path: index_cache_path.clone(),
-            crate_cache_path: gctx.registry_cache_path().join(name),
+            crate_cache_path: gctx.registry_artifact_cache_path()?.join(name),
             source_id,
             gctx,
             url,

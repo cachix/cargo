@@ -610,6 +610,9 @@ impl Summaries {
                     // about to return, write that back out to disk so future Cargo
                     // invocations can use it.
                     cache_manager.put(lowered_name, &cache_bytes);
+                    if source_id.is_sparse() {
+                        load.persist()?;
+                    }
 
                     // If we've got debug assertions enabled read back in the cached values
                     // and assert they match the expected result.

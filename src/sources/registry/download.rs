@@ -37,6 +37,11 @@ pub(super) fn download(
     let path = cache_path.join(&pkg.tarball_name());
     let path = gctx.assert_package_cache_locked(CacheLockMode::DownloadExclusive, &path);
 
+    gctx.prepare_registry_artifact(
+        &format!("{encoded_registry_name}/{}", pkg.tarball_name()),
+        path,
+    )?;
+
     // Attempt to open a read-only copy first to avoid an exclusive write
     // lock and also work with read-only filesystems. Note that we check the
     // length of the file like below to handle interrupted downloads.
@@ -46,13 +51,15 @@ pub(super) fn download(
     if let Ok(dst) = File::open(path) {
         let meta = dst.metadata()?;
         if meta.len() > 0 {
-            gctx.deferred_global_last_use()?.mark_registry_crate_used(
-                global_cache_tracker::RegistryCrate {
-                    encoded_registry_name,
-                    crate_filename: pkg.tarball_name().into(),
-                    size: meta.len(),
-                },
-            );
+            if gctx.artifacts_use_global_cache()? {
+                gctx.deferred_global_last_use()?.mark_registry_crate_used(
+                    global_cache_tracker::RegistryCrate {
+                        encoded_registry_name,
+                        crate_filename: pkg.tarball_name().into(),
+                        size: meta.len(),
+                    },
+                );
+            }
             return Ok(MaybeLock::Ready(dst));
         }
     }
@@ -101,13 +108,15 @@ pub(super) fn finish_download(
     if actual != checksum {
         anyhow::bail!("failed to verify the checksum of `{}`", pkg)
     }
-    gctx.deferred_global_last_use()?.mark_registry_crate_used(
-        global_cache_tracker::RegistryCrate {
-            encoded_registry_name,
-            crate_filename: pkg.tarball_name().into(),
-            size: data.len() as u64,
-        },
-    );
+    if gctx.artifacts_use_global_cache()? {
+        gctx.deferred_global_last_use()?.mark_registry_crate_used(
+            global_cache_tracker::RegistryCrate {
+                encoded_registry_name,
+                crate_filename: pkg.tarball_name().into(),
+                size: data.len() as u64,
+            },
+        );
+    }
 
     cache_path.create_dir()?;
     let path = cache_path.join(&pkg.tarball_name());
@@ -124,6 +133,11 @@ pub(super) fn finish_download(
     }
 
     dst.write_all(data)?;
+    dst.sync_all()?;
+    gctx.persist_registry_artifact(
+        &format!("{encoded_registry_name}/{}", pkg.tarball_name()),
+        path,
+    )?;
     dst.seek(SeekFrom::Start(0))?;
     Ok(dst)
 }
@@ -135,12 +149,17 @@ pub(super) fn finish_download(
 pub(super) fn is_crate_downloaded(
     cache_path: &Filesystem,
     gctx: &GlobalContext,
+    encoded_registry_name: InternedString,
     pkg: PackageId,
 ) -> bool {
     let path = cache_path.join(pkg.tarball_name());
     let path = gctx.assert_package_cache_locked(CacheLockMode::DownloadExclusive, &path);
     if let Ok(meta) = fs::metadata(path) {
-        return meta.len() > 0;
+        if meta.len() > 0 {
+            return true;
+        }
     }
-    false
+    // This is an availability hint; the download path reports restoration errors.
+    gctx.registry_artifact_is_retained(&format!("{encoded_registry_name}/{}", pkg.tarball_name()))
+        .unwrap_or(false)
 }

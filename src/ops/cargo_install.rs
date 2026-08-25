@@ -377,6 +377,8 @@ impl<'gctx> InstallablePackage<'gctx> {
         if !self.source_id.is_path() {
             let target_dir = if let Some(dir) = self.gctx.target_dir()? {
                 dir
+            } else if let Some(dir) = self.gctx.workspace_artifact_dir(self.ws.root_manifest())? {
+                dir
             } else if let Ok(td) = TempFileBuilder::new().prefix("cargo-install").tempdir() {
                 let p = td.path().to_owned();
                 td_opt = Some(td);

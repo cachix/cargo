@@ -231,6 +231,17 @@ impl<'gctx> Workspace<'gctx> {
 
         ws.target_dir = gctx.target_dir()?;
         ws.build_dir = gctx.build_dir(ws.root_manifest())?;
+        if ws.target_dir.is_none() {
+            if let Some(dir) = gctx.workspace_artifact_dir(ws.root_manifest())? {
+                // Keep the target and intermediate build state together, as
+                // Cargo's normal workspace layout does. Explicit target and
+                // build directories above always take precedence.
+                ws.target_dir = Some(dir);
+            }
+        }
+        if ws.build_dir.is_none() {
+            ws.build_dir = ws.target_dir.clone();
+        }
 
         ws.custom_metadata = ws
             .load_workspace_config()?
@@ -294,8 +305,10 @@ impl<'gctx> Workspace<'gctx> {
             .insert(ws.current_manifest.clone(), package);
         ws.target_dir = if let Some(dir) = target_dir {
             Some(dir)
+        } else if let Some(dir) = ws.gctx.target_dir()? {
+            Some(dir)
         } else {
-            ws.gctx.target_dir()?
+            ws.gctx.workspace_artifact_dir(ws.root_manifest())?
         };
         ws.build_dir = ws.target_dir.clone();
         ws.members.insert(ws.current_manifest.clone());

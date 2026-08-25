@@ -182,6 +182,7 @@
 //! ```
 //!
 
+use crate::artifact_storage::DependencyCache;
 use crate::util::data_structures::HashSet;
 use std::cell::RefCell;
 use std::fs;
@@ -294,6 +295,10 @@ pub trait RegistryData {
     /// This should be safe to call multiple times, the implementation is
     /// expected to not do any work if it is already prepared.
     fn prepare(&self) -> CargoResult<()>;
+
+    fn persist(&self) -> CargoResult<()> {
+        Ok(())
+    }
 
     /// Returns the path to the index.
     ///
@@ -441,7 +446,7 @@ impl<'gctx> RegistrySource<'gctx> {
         let ops = if source_id.is_sparse() {
             Box::new(http_remote::HttpRegistry::new(source_id, gctx, &name)?) as Box<_>
         } else {
-            Box::new(git_remote::GitRegistry::new(source_id, gctx, &name)) as Box<_>
+            Box::new(git_remote::GitRegistry::new(source_id, gctx, &name)?) as Box<_>
         };
 
         Ok(RegistrySource::new(source_id, gctx, &name, ops))
@@ -555,6 +560,12 @@ impl<'gctx> RegistrySource<'gctx> {
     fn unpack_package(&self, pkg: PackageId, tarball: &File) -> CargoResult<PathBuf> {
         let package_dir = format!("{}-{}", pkg.name(), pkg.version());
         let dst = self.src_path.join(&package_dir);
+        let cache_key = format!("{}/{}", self.name, package_dir);
+        self.gctx.prepare_dependency_artifacts(
+            DependencyCache::RegistrySource,
+            &cache_key,
+            &dst,
+        )?;
         let path = dst.join(PACKAGE_SOURCE_LOCK);
         let path = self
             .gctx
@@ -570,6 +581,11 @@ impl<'gctx> RegistrySource<'gctx> {
                             package_dir: package_dir.into(),
                             size: None,
                         });
+                    self.gctx.persist_dependency_artifacts(
+                        DependencyCache::RegistrySource,
+                        &cache_key,
+                        &dst,
+                    )?;
                     return Ok(unpack_dir.to_path_buf());
                 }
                 _ => {
@@ -610,6 +626,12 @@ impl<'gctx> RegistrySource<'gctx> {
                 size: Some(bytes_written),
             });
 
+        drop(ok);
+        self.gctx.persist_dependency_artifacts(
+            DependencyCache::RegistrySource,
+            &cache_key,
+            &dst,
+        )?;
         Ok(unpack_dir.to_path_buf())
     }
 

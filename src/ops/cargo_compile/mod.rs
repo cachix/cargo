@@ -149,7 +149,28 @@ pub fn compile_with_exec<'a>(
         ws,
         crate::diagnostics::rules::PARSE_PASS_RULES,
     )?;
-    let compilation = compile_ws(ws, options, exec)?;
+    ws.gctx()
+        .prepare_workspace_artifacts(ws.root_manifest(), &ws.target_dir(), &ws.build_dir())?;
+    let compilation = compile_ws(ws, options, exec);
+    let persisted = ws.gctx().persist_workspace_artifacts(
+        ws.root_manifest(),
+        &ws.target_dir(),
+        &ws.build_dir(),
+    );
+    let compilation = match compilation {
+        Ok(compilation) => {
+            persisted?;
+            compilation
+        }
+        Err(error) => {
+            if let Err(storage_error) = persisted {
+                let _ = ws.gctx().shell().warn(format!(
+                    "could not persist workspace artifacts: {storage_error:#}"
+                ));
+            }
+            return Err(error);
+        }
+    };
     if ws.gctx().warning_handling()? == WarningHandling::Deny
         && (compilation.lint_warning_count + parse_pass_output.lint_warning_count) > 0
     {

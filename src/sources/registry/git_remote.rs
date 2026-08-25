@@ -1,5 +1,6 @@
 //! Access to a Git index based registry. See [`GitRegistry`] for details.
 
+use crate::artifact_storage::DependencyCache;
 use crate::sources::git;
 use crate::sources::git::fetch::RemoteKind;
 use crate::sources::git::resolve_ref;
@@ -88,11 +89,15 @@ impl<'gctx> GitRegistry<'gctx> {
     ///
     /// * `name` --- Name of a path segment where `.crate` tarballs and the
     ///   registry index are stored. Expect to be unique.
-    pub fn new(source_id: SourceId, gctx: &'gctx GlobalContext, name: &str) -> GitRegistry<'gctx> {
-        GitRegistry {
+    pub fn new(
+        source_id: SourceId,
+        gctx: &'gctx GlobalContext,
+        name: &str,
+    ) -> CargoResult<GitRegistry<'gctx>> {
+        Ok(GitRegistry {
             name: name.into(),
             index_path: gctx.registry_index_path().join(name),
-            cache_path: gctx.registry_cache_path().join(name),
+            cache_path: gctx.registry_artifact_cache_path()?.join(name),
             source_id,
             gctx,
             index_git_ref: GitReference::DefaultBranch,
@@ -102,12 +107,18 @@ impl<'gctx> GitRegistry<'gctx> {
             current_sha: Cell::new(None),
             needs_update: Cell::new(false),
             quiet: false,
-        }
+        })
     }
 
     /// Creates intermediate dirs and initialize the repository.
     fn repo(&self) -> CargoResult<Ref<'_, Option<git2::Repository>>> {
         if self.repo.borrow().is_none() {
+            self.gctx.prepare_dependency_artifacts(
+                DependencyCache::RegistryIndex,
+                &self.name,
+                &self.index_path,
+            )?;
+            self.persist()?;
             trace!("acquiring registry index lock");
             let path = self
                 .gctx
@@ -272,7 +283,7 @@ impl<'gctx> GitRegistry<'gctx> {
         )
         .with_context(|| format!("failed to fetch `{}`", url))?;
 
-        Ok(())
+        self.persist()
     }
 }
 
@@ -286,6 +297,14 @@ impl<'gctx> RegistryData for GitRegistry<'gctx> {
                 encoded_registry_name: self.name,
             });
         Ok(())
+    }
+
+    fn persist(&self) -> CargoResult<()> {
+        self.gctx.persist_dependency_artifacts(
+            DependencyCache::RegistryIndex,
+            &self.name,
+            &self.index_path,
+        )
     }
 
     fn index_path(&self) -> &Filesystem {
@@ -449,7 +468,7 @@ impl<'gctx> RegistryData for GitRegistry<'gctx> {
     }
 
     fn is_crate_downloaded(&self, pkg: PackageId) -> bool {
-        download::is_crate_downloaded(&self.cache_path, &self.gctx, pkg)
+        download::is_crate_downloaded(&self.cache_path, &self.gctx, self.name, pkg)
     }
 }
 

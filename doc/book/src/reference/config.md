@@ -775,6 +775,16 @@ Controls how often we display a notification to the terminal when a future incom
 
 The `[cache]` table defines settings for cargo's caches.
 
+#### `cache.storage`
+* Type: string
+* Default: `"filesystem"`
+* Environment: `CARGO_CACHE_STORAGE`
+
+Selects where Cargo stores artifacts. The default `"filesystem"` backend uses
+`$CARGO_HOME/registry/cache` for downloaded registry `.crate` archives and
+the workspace's `target` directory for build outputs. Additional backends may
+be made available through unstable Cargo features.
+
 #### Global caches
 
 When running `cargo` commands, Cargo will automatically track which files you are using within the global cache.

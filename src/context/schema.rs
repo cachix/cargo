@@ -36,6 +36,7 @@ use super::path::ConfigRelativePath;
 #[derive(Debug, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub struct CargoCacheConfig {
+    pub storage: Option<String>,
     /// How often to automatically clean unused cache data.
     pub auto_clean_frequency: Option<String>,
     /// Settings for cleaning the global cache.

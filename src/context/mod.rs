@@ -61,6 +61,7 @@
 //! read the environment variable due to ambiguity. (See `ConfigMapAccess` for
 //! more details.)
 
+use crate::artifact_storage::{ArtifactStorage, DependencyCache, FilesystemStorage};
 use crate::util::data_structures::{HashMap, HashSet};
 use std::borrow::Cow;
 use std::env;
@@ -476,6 +477,122 @@ impl GlobalContext {
     /// Gets the Cargo registry cache directory (`<cargo_home>/registry/cache`).
     pub fn registry_cache_path(&self) -> Filesystem {
         self.registry_base_path().join("cache")
+    }
+
+    /// Selects the configured artifact storage backend.
+    fn artifact_storage(&self) -> CargoResult<Box<dyn ArtifactStorage>> {
+        let storage = self.get_string(["cache", "storage"])?;
+        match storage.as_ref().map(|value| value.val.as_str()) {
+            None | Some("filesystem") => {
+                Ok(Box::new(FilesystemStorage::new(self.registry_cache_path())))
+            }
+            Some(value) => bail!(
+                "unsupported cache storage backend `{value}`; expected `filesystem`"
+            ),
+        }
+    }
+
+    /// Gets the storage location for downloaded registry archives.
+    pub fn registry_artifact_cache_path(&self) -> CargoResult<Filesystem> {
+        let storage = self.artifact_storage()?;
+        storage.prepare_registry_archives()?;
+        Ok(storage.registry_archive_dir())
+    }
+
+    /// Gets the backend-specific replacement for a workspace's default target
+    /// directory, if the selected backend has one.
+    pub(crate) fn workspace_artifact_dir(
+        &self,
+        workspace_manifest_path: &Path,
+    ) -> CargoResult<Option<Filesystem>> {
+        let storage = self.artifact_storage()?;
+        Ok(storage.workspace_artifact_dir(workspace_manifest_path))
+    }
+
+    pub(crate) fn prepare_registry_artifact(&self, key: &str, path: &Path) -> CargoResult<()> {
+        self.assert_package_cache_locked(
+            CacheLockMode::DownloadExclusive,
+            &Filesystem::new(path.to_owned()),
+        );
+        self.artifact_storage()?.prepare_registry_archive(key, path)
+    }
+
+    pub(crate) fn registry_artifact_is_retained(&self, key: &str) -> CargoResult<bool> {
+        self.artifact_storage()?.registry_archive_is_retained(key)
+    }
+
+    /// Imports one verified archive written to the selected backend's checkout.
+    pub(crate) fn persist_registry_artifact(&self, key: &str, path: &Path) -> CargoResult<()> {
+        self.assert_package_cache_locked(
+            CacheLockMode::DownloadExclusive,
+            &Filesystem::new(path.to_owned()),
+        );
+        self.artifact_storage()?.persist_registry_archive(key, path)
+    }
+
+    pub(crate) fn prepare_dependency_artifacts(
+        &self,
+        cache: DependencyCache,
+        key: &str,
+        directory: &Filesystem,
+    ) -> CargoResult<()> {
+        self.assert_package_cache_locked(CacheLockMode::DownloadExclusive, directory);
+        self.artifact_storage()?
+            .prepare_dependency_artifacts(cache, key, directory)
+    }
+
+    pub(crate) fn persist_dependency_artifacts(
+        &self,
+        cache: DependencyCache,
+        key: &str,
+        directory: &Filesystem,
+    ) -> CargoResult<()> {
+        self.assert_package_cache_locked(CacheLockMode::DownloadExclusive, directory);
+        self.artifact_storage()?
+            .persist_dependency_artifacts(cache, key, directory)
+    }
+
+    pub(crate) fn persist_git_database(
+        &self,
+        key: &str,
+        directory: &Filesystem,
+        revision: &str,
+    ) -> CargoResult<()> {
+        self.assert_package_cache_locked(CacheLockMode::DownloadExclusive, directory);
+        self.artifact_storage()?
+            .persist_git_database(key, directory, revision)
+    }
+
+    pub(crate) fn prepare_workspace_artifacts(
+        &self,
+        workspace_manifest_path: &Path,
+        target_dir: &Filesystem,
+        build_dir: &Filesystem,
+    ) -> CargoResult<()> {
+        self.artifact_storage()?.prepare_workspace_artifacts(
+            workspace_manifest_path,
+            target_dir,
+            build_dir,
+        )
+    }
+
+    /// Imports a workspace's build outputs after Cargo finishes compiling.
+    pub(crate) fn persist_workspace_artifacts(
+        &self,
+        workspace_manifest_path: &Path,
+        target_dir: &Filesystem,
+        build_dir: &Filesystem,
+    ) -> CargoResult<()> {
+        self.artifact_storage()?.persist_workspace_artifacts(
+            workspace_manifest_path,
+            target_dir,
+            build_dir,
+        )
+    }
+
+    /// Returns whether Cargo's global-cache tracker owns stored artifacts.
+    pub(crate) fn artifacts_use_global_cache(&self) -> CargoResult<bool> {
+        Ok(self.artifact_storage()?.participates_in_global_cache())
     }
 
     /// Gets the Cargo registry source directory (`<cargo_home>/registry/src`).
@@ -2102,7 +2219,13 @@ impl GlobalContext {
             "package cache lock is not currently held, Cargo forgot to call \
              `acquire_package_cache_lock` before we got to this stack frame",
         );
-        assert!(ret.starts_with(self.home_path.as_path_unlocked()));
+        let artifact_storage = self
+            .artifact_storage()
+            .expect("artifact storage configuration should already be valid");
+        assert!(
+            ret.starts_with(self.home_path.as_path_unlocked())
+                || ret.starts_with(artifact_storage.registry_archive_dir().as_path_unlocked())
+        );
         ret
     }
 

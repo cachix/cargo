@@ -1,5 +1,6 @@
 //! See [`GitSource`].
 
+use crate::artifact_storage::DependencyCache;
 use crate::sources::IndexSummary;
 use crate::sources::RecursivePathSource;
 use crate::sources::git::utils::GitDatabase;
@@ -184,6 +185,11 @@ impl<'gctx> GitSource<'gctx> {
     /// already available locally.
     pub(crate) fn fetch_db(&self, is_submodule: bool) -> CargoResult<(GitDatabase, git2::Oid)> {
         let db_path = self.gctx.git_db_path().join(&self.ident);
+        self.gctx.prepare_dependency_artifacts(
+            DependencyCache::GitDatabase,
+            &self.ident,
+            &db_path,
+        )?;
         let db_path = db_path.into_path_unlocked();
 
         let db = self.remote.db_at(&db_path).ok();
@@ -241,6 +247,11 @@ impl<'gctx> GitSource<'gctx> {
                     .checkout(&db_path, db, manifest_reference, &locked_rev, self.gctx)?
             }
         };
+        self.gctx.persist_git_database(
+            &self.ident,
+            &self.gctx.git_db_path().join(&self.ident),
+            &actual_rev.to_string(),
+        )?;
         Ok((db, actual_rev))
     }
 
@@ -283,8 +294,24 @@ impl<'gctx> GitSource<'gctx> {
             .git_checkouts_path()
             .join(&self.ident)
             .join(short_id.as_str());
+        let checkout_key = format!("{}/{}", self.ident, short_id);
+        self.gctx.prepare_dependency_artifacts(
+            DependencyCache::GitCheckout,
+            &checkout_key,
+            &checkout_path,
+        )?;
+        db.copy_to(
+            actual_rev,
+            checkout_path.as_path_unlocked(),
+            self.gctx,
+            self.quiet,
+        )?;
+        self.gctx.persist_dependency_artifacts(
+            DependencyCache::GitCheckout,
+            &checkout_key,
+            &checkout_path,
+        )?;
         let checkout_path = checkout_path.into_path_unlocked();
-        db.copy_to(actual_rev, &checkout_path, self.gctx, self.quiet)?;
 
         let source_id = self
             .source_id
