@@ -89,6 +89,7 @@ Each new feature described below should explain how to use it.
     * [build-std-features](#build-std-features) --- Sets features to use with the standard library.
     * [binary-dep-depinfo](#binary-dep-depinfo) --- Causes the dep-info file to track binary dependencies.
     * [checksum-freshness](#checksum-freshness) --- When passed, the decision as to whether a crate needs to be rebuilt is made using file checksums instead of the file mtime.
+    * [casita-storage](#casita-storage) --- Stores Cargo artifacts in the Casita backend.
     * [panic-abort-tests](#panic-abort-tests) --- Allows running tests with the "abort" panic strategy.
     * [host-config](#host-config) --- Allows setting `[target]`-like configuration settings for host build targets.
     * [embed-metadata](#embed-metadata) --- If set to `no`, cargo will pass `-Zembed-metadata=no` to the compiler, which avoid embedding metadata into rlib and dylib artifacts, to save disk space.
@@ -599,6 +600,78 @@ that information for change-detection (if any binary dependency changes, then
 the crate will be rebuilt). The primary use case is for building the compiler
 itself, which has implicit dependencies on the standard library that would
 otherwise be untracked for change-detection.
+
+## casita-storage
+
+The `-Z casita-storage` flag enables the `casita` artifact storage backend.
+Select it in Cargo configuration:
+
+```toml
+[cache]
+storage = "casita"
+```
+
+Cargo imports registry indexes (Git and sparse), downloaded `.crate` archives,
+unpacked registry sources, Git databases and checkouts (including submodules),
+and target and intermediate build directories into Casita's default per-user repository
+(normally the OS data directory joined with `casita`). By default, it retains a
+working build cache under the OS temporary directory, isolated by repository and
+workspace, and restores it from Casita if removed. Archives, dependency sources,
+and indexes retain Cargo's usual cache paths as
+working copies, with snapshots isolated by registry, package, or Git revision.
+They can be restored during resolution and fetching, including offline
+`cargo generate-lockfile` and `cargo fetch`.
+Build roots are isolated by workspace manifest and directory layout.
+Cargo remains responsible for resolution, checksum validation, unpacking, and
+builds. Explicit
+`--target-dir`, `CARGO_TARGET_DIR`, `build.target-dir`, and `build.build-dir`
+settings still take precedence and their directories are also persisted.
+Existing nonempty directories are preserved; absent or empty directories are
+restored from Casita. Completed outputs from failed builds are also persisted.
+Snapshots preserve file, directory, and symlink modification times so restoring
+artifacts does not itself invalidate Cargo's timestamp-based freshness checks.
+Snapshots captured on Unix also retain permissions and hardlink relationships,
+avoiding needless relinking and metadata changes after restoration.
+Older snapshots without timestamps remain readable and gain timestamp metadata
+on their next import.
+Git dependency databases use Casita's native Git importer while retaining every
+cached object, including commits and blobs no longer reachable from current refs.
+Objects already retained in Casita are merged before publication, so a fresh local
+database cannot replace a more complete durable cache.
+Original `.crate` bytes use individual blob-backed snapshots: downloading another
+crate does not reimport or verify previously persisted archives. Missing archives
+are restored individually when requested, rather than loading the whole archive cache.
+Offline resolution checks retained archive roots without restoring unused versions.
+Unchanged registry source files use gzip tar imports. Cargo keeps its unpacking checks,
+source edits, and metadata in a versioned filesystem snapshot that records the
+matching native restore requests. Build outputs and Git checkouts remain
+filesystem snapshots. Native operations fall back to filesystem storage only
+when Casita reports an unsupported operation; execution failures are errors.
+Older filesystem snapshots remain readable.
+
+Before publishing a snapshot, Cargo checks its contents and metadata against the
+last retained snapshot. Unchanged snapshots skip import and native verification.
+Changed workspace trees are imported directly, allowing Casita to reuse unchanged
+files by their filesystem identity. A companion snapshot retains timestamps,
+permissions, and hardlink relationships without creating temporary hardlinks to
+the working files. The preceding tree remains retained until publication completes.
+On Unix, cached file digests also check file identity and precise change times,
+so edits with preserved modification times are detected without rereading every
+unchanged artifact. Other platforms and files with coarse change times rehash
+file contents. The `CARGO_LOG=cargo::context::casita=debug` diagnostic includes
+operation durations, bytes hashed, and skipped publications.
+
+Cargo's global-cache garbage collector can evict dependency working copies,
+but does not remove the stored Casita snapshots. Each snapshot owns its native
+roots. Cargo journals pending imports and serializes publication, restoration,
+and root retirement with a repository lock. After publishing a replacement,
+it unregisters superseded and abandoned native roots so Casita GC can reclaim
+unreferenced data. Legacy shared native roots remain retained while any Cargo
+snapshot references them.
+
+This is the storage half of Cargo evidence: dependency caches and mutable build
+artifacts use the same per-user Casita store, while complete lockfile/registry
+bundles and derived query evidence remain future work.
 
 ## checksum-freshness
 * Tracking issue: [#14136](https://github.com/rust-lang/cargo/issues/14136)

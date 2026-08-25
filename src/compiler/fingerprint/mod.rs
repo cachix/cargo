@@ -423,7 +423,6 @@ use super::custom_build::BuildDeps;
 
 pub use self::dep_info::Checksum;
 pub use self::dep_info::parse_dep_info;
-pub use self::dep_info::parse_rustc_dep_info;
 pub use self::dep_info::translate_dep_info;
 pub use self::dirty_reason::DirtyReason;
 pub use self::rustdoc::RustdocFingerprint;

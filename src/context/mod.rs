@@ -105,6 +105,9 @@ use time::OffsetDateTime;
 use toml_edit::Item;
 use url::Url;
 
+mod casita;
+use casita::CasitaArtifactStorage;
+
 mod de;
 use de::Deserializer;
 
@@ -486,8 +489,18 @@ impl GlobalContext {
             None | Some("filesystem") => {
                 Ok(Box::new(FilesystemStorage::new(self.registry_cache_path())))
             }
+            Some("casita") => {
+                if !self.cli_unstable().casita_storage {
+                    bail!(
+                        "`cache.storage = \"casita\"` requires the `-Zcasita-storage` unstable feature"
+                    )
+                }
+                Ok(Box::new(CasitaArtifactStorage::default_repository(
+                    self.registry_cache_path(),
+                )))
+            }
             Some(value) => bail!(
-                "unsupported cache storage backend `{value}`; expected `filesystem`"
+                "unsupported cache storage backend `{value}`; expected `filesystem` or `casita`"
             ),
         }
     }

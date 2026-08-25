@@ -17,6 +17,308 @@ use cargo_test_support::{Project, sleep_ms, str, t};
 use cargo_test_support::{basic_lib_manifest, basic_manifest, git, main_file, project};
 
 #[cargo_test]
+fn casita_storage_restores_git_dependencies_and_submodules() {
+    casita_git_roundtrip(false);
+}
+
+#[cargo_test]
+fn casita_storage_restores_pinned_git_revision() {
+    casita_git_roundtrip(true);
+}
+
+fn casita_git_roundtrip(pinned: bool) {
+    if !crate::casita_available() {
+        return;
+    }
+    let submodule = git::new("casita-submodule", |p| {
+        p.file("lib.rs", "pub fn value() -> u32 { 42 }")
+    });
+    let dependency = git::new("casita-dependency", |p| {
+        p.file(
+            "Cargo.toml",
+            &format!(
+                "{}\n[lib]\npath = \"sub/lib.rs\"",
+                basic_manifest("bar", "0.0.1")
+            ),
+        )
+    });
+    let repo = git2::Repository::open(dependency.root()).unwrap();
+    git::add_submodule(&repo, submodule.url().as_str(), Path::new("sub"));
+    git::commit(&repo);
+    let revision = repo.head().unwrap().peel_to_commit().unwrap().id();
+    let pin = if pinned {
+        format!(", rev = {:?}", revision.to_string())
+    } else {
+        String::new()
+    };
+    drop(repo);
+    let p = project()
+        .file(
+            "Cargo.toml",
+            &format!(
+                "{}\n[dependencies]\nbar = {{ git = {:?}{pin} }}",
+                basic_manifest("foo", "0.0.1"),
+                dependency.url().as_str()
+            ),
+        )
+        .file(
+            "src/lib.rs",
+            "extern crate bar; pub fn value() -> u32 { bar::value() }",
+        )
+        .file(".cargo/config.toml", "[cache]\nstorage = \"casita\"\n")
+        .build();
+    let repository = tempfile::tempdir_in(paths::root()).unwrap();
+    let run = |args: &str| {
+        let mut command = p.cargo(args);
+        command
+            .masquerade_as_nightly_cargo(&["casita-storage"])
+            .env("XDG_DATA_HOME", repository.path());
+        command
+    };
+    run("fetch -Zcasita-storage").run();
+    let output = p
+        .process("casita")
+        .arg("--repository")
+        .arg(repository.path().join("casita"))
+        .args(&["root", "ls", "cargo/native"])
+        .exec_with_output()
+        .unwrap();
+    assert!(!output.stdout.is_empty(), "native Git import was not used");
+    let git_cache = paths::cargo_home().join("git");
+    let checkout = walkdir::WalkDir::new(git_cache.join("checkouts"))
+        .into_iter()
+        .map(|entry| entry.unwrap().into_path())
+        .find(|path| path.file_name().unwrap() == "Cargo.toml")
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_owned();
+    let marker = checkout.join("casita-roundtrip");
+    fs::write(&marker, "stored git checkout").unwrap();
+    run("fetch -Zcasita-storage").run();
+    fs::rename(
+        dependency.root(),
+        dependency.root().with_extension("unavailable"),
+    )
+    .unwrap();
+    fs::rename(
+        submodule.root(),
+        submodule.root().with_extension("unavailable"),
+    )
+    .unwrap();
+    p.process("casita")
+        .arg("--repository")
+        .arg(repository.path().join("casita"))
+        .arg("gc")
+        .run();
+    cargo_util::paths::remove_dir_all(&git_cache).unwrap();
+    fs::remove_file(p.root().join("Cargo.lock")).unwrap();
+    run("generate-lockfile --offline -Zcasita-storage").run();
+    run("fetch --offline -Zcasita-storage").run();
+    assert_eq!(fs::read_to_string(&marker).unwrap(), "stored git checkout");
+    assert_eq!(
+        fs::read_to_string(checkout.join("sub/lib.rs")).unwrap(),
+        "pub fn value() -> u32 { 42 }"
+    );
+    cargo_util::paths::remove_dir_all(&git_cache).unwrap();
+    fs::create_dir_all(&checkout).unwrap();
+    fs::write(
+        checkout.join("local-state"),
+        "force checkout from restored databases",
+    )
+    .unwrap();
+    run("fetch --offline -Zcasita-storage").run();
+    assert_eq!(fs::read_dir(git_cache.join("db")).unwrap().count(), 2);
+    for db in fs::read_dir(git_cache.join("db")).unwrap() {
+        p.process("git")
+            .arg("--git-dir")
+            .arg(db.unwrap().path())
+            .args(&["fsck", "--full"])
+            .run();
+    }
+    run("check --offline -Zcasita-storage").run();
+}
+
+#[cargo_test]
+#[cfg(unix)]
+fn casita_storage_retains_old_git_objects_and_retires_roots() {
+    if !crate::casita_available() {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let dependency = git::new("rewritten", |p| {
+        p.file("Cargo.toml", &basic_lib_manifest("bar"))
+            .file("src/lib.rs", "")
+    });
+    let source = git2::Repository::open(dependency.root()).unwrap();
+    let old = source.head().unwrap().peel_to_commit().unwrap();
+    let p = project()
+        .file(
+            "Cargo.toml",
+            &format!(
+                "{}\n[dependencies]\nbar = {{ git = {:?} }}",
+                basic_manifest("foo", "0.0.1"),
+                dependency.url().as_str()
+            ),
+        )
+        .file("src/lib.rs", "extern crate bar;")
+        .file(".cargo/config.toml", "[cache]\nstorage = \"casita\"\n")
+        .build();
+    let repository = tempfile::tempdir_in(paths::root()).unwrap();
+    let run = |args: &str| {
+        let mut cmd = p.cargo(args);
+        cmd.masquerade_as_nightly_cargo(&["casita-storage"])
+            .env("XDG_DATA_HOME", repository.path());
+        cmd
+    };
+    let roots = |prefix: &str| {
+        let output = p
+            .process("casita")
+            .arg("--repository")
+            .arg(repository.path().join("casita"))
+            .args(&["root", "ls", prefix])
+            .exec_with_output()
+            .unwrap();
+        String::from_utf8(output.stdout).unwrap()
+    };
+    run("fetch -Zcasita-storage").run();
+    let lockfile = fs::read(p.root().join("Cargo.lock")).unwrap();
+    let git_roots = || {
+        roots("cargo/native")
+            .lines()
+            .filter(|line| line.contains("/git/"))
+            .map(|line| format!("{line}\n"))
+            .collect::<String>()
+    };
+    let original_roots = git_roots();
+    assert_eq!(original_roots.lines().count(), 1);
+    let original_root = original_roots.split_whitespace().nth(1).unwrap();
+    let db_path = fs::read_dir(paths::cargo_home().join("git/db"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let unreadable = db_path.join("unreadable");
+    fs::write(&unreadable, "failed publication").unwrap();
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+    let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+    let rewritten = source
+        .commit(
+            None,
+            &signature,
+            &signature,
+            "rewritten history",
+            &old.tree().unwrap(),
+            &[],
+        )
+        .unwrap();
+    source
+        .reference(
+            source.head().unwrap().name().unwrap(),
+            rewritten,
+            true,
+            "force push",
+        )
+        .unwrap();
+    run("update -p bar -Zcasita-storage")
+        .with_status(101)
+        .with_stderr_contains("[..]Permission denied[..]")
+        .run();
+    assert!(
+        git_roots().contains(original_root),
+        "failed publication retired the live root"
+    );
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::remove_file(&unreadable).unwrap();
+    run("update -p bar -Zcasita-storage").run();
+    assert!(
+        fs::read_to_string(p.root().join("Cargo.lock"))
+            .unwrap()
+            .contains(&rewritten.to_string())
+    );
+    let db = git2::Repository::open_bare(&db_path).unwrap();
+    assert!(db.find_commit(old.id()).is_ok());
+    let dangling = db
+        .odb()
+        .unwrap()
+        .write(git2::ObjectType::Blob, b"unreachable cached bytes")
+        .unwrap();
+    drop(db);
+    run("fetch -Zcasita-storage").run();
+    let current = git_roots();
+    assert_eq!(
+        current.lines().count(),
+        1,
+        "superseded roots leaked: {current}"
+    );
+    assert!(!current.contains(original_root));
+    assert!(roots("git").is_empty(), "temporary import roots leaked");
+    let fields = current.split_whitespace().collect::<Vec<_>>();
+    let owner = fields[1].split('/').nth(2).unwrap();
+    let abandoned = format!("cargo/native/{owner}/git/abandoned");
+    let journal = repository
+        .path()
+        .join("casita/.cargo-native-roots")
+        .join(format!("{owner}.json"));
+    let mut recorded: Vec<String> = serde_json::from_slice(&fs::read(&journal).unwrap()).unwrap();
+    recorded.push(abandoned.clone());
+    recorded.push(format!("cargo/native/{owner}/git/never-published"));
+    fs::write(&journal, serde_json::to_vec(&recorded).unwrap()).unwrap();
+    p.process("casita")
+        .arg("--repository")
+        .arg(repository.path().join("casita"))
+        .args(&["root", "set", &abandoned, fields[0]])
+        .run();
+    run("fetch -Zcasita-storage").run();
+    assert_eq!(
+        git_roots().lines().count(),
+        1,
+        "abandoned publication was not cleaned up"
+    );
+    p.process("git")
+        .arg("-C")
+        .arg(dependency.root())
+        .args(&["reflog", "expire", "--expire=now", "--all"])
+        .run();
+    p.process("git")
+        .arg("-C")
+        .arg(dependency.root())
+        .args(&["gc", "--prune=now"])
+        .run();
+    cargo_util::paths::remove_dir_all(&db_path).unwrap();
+    git2::Repository::init_bare(&db_path).unwrap();
+    run("fetch -Zcasita-storage").run();
+    assert!(
+        git2::Repository::open_bare(&db_path)
+            .unwrap()
+            .find_commit(old.id())
+            .is_err(),
+        "fixture should model a fresh object database"
+    );
+    cargo_util::paths::remove_dir_all(paths::cargo_home().join("git")).unwrap();
+    fs::rename(
+        dependency.root(),
+        dependency.root().with_extension("unavailable"),
+    )
+    .unwrap();
+    fs::write(p.root().join("Cargo.lock"), lockfile).unwrap();
+    p.process("casita")
+        .arg("--repository")
+        .arg(repository.path().join("casita"))
+        .arg("gc")
+        .run();
+    run("fetch --offline -Zcasita-storage").run();
+    let restored = git2::Repository::open_bare(&db_path).unwrap();
+    assert!(restored.find_commit(old.id()).is_ok());
+    assert_eq!(
+        restored.find_blob(dangling).unwrap().content(),
+        b"unreachable cached bytes"
+    );
+    run("check --offline -Zcasita-storage").run();
+}
+
+#[cargo_test]
 fn cargo_compile_simple_git_dep() {
     let project = project();
     let git_project = git::new("dep1", |project| {

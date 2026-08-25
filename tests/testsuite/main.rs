@@ -214,6 +214,14 @@ pub mod prelude {
     pub use cargo_test_support::prelude::*;
 }
 
+fn casita_available() -> bool {
+    cfg!(target_os = "linux")
+        && std::process::Command::new("casita")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+}
+
 #[cargo_test]
 fn aaa_trigger_cross_compile_disabled_check() {
     // This triggers the cross compile disabled check to run ASAP, see #5141

@@ -4,7 +4,7 @@
 use crate::util::data_structures::HashSet;
 use cargo_util::paths::normalize_path;
 use std::collections::BTreeSet;
-use std::io::{BufWriter, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use super::{BuildRunner, FileFlavor, Unit, fingerprint};
@@ -164,26 +164,16 @@ pub fn output_depinfo(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> Ca
             if success {
                 let target_fn = render_filename(link_dst, basedir)?;
 
-                // If nothing changed don't recreate the file which could alter
-                // its mtime
-                if let Ok(previous) = fingerprint::parse_rustc_dep_info(&output_path) {
-                    if previous
-                        .files
-                        .iter()
-                        .map(|(path, _checksum)| path)
-                        .eq(deps.iter().map(Path::new))
-                    {
-                        continue;
-                    }
-                }
-
-                // Otherwise write it all out
-                let mut outfile = BufWriter::new(paths::create(output_path)?);
+                // Compare serialized bytes, including escaped paths. Parsing the
+                // previous file and comparing it to rendered paths can rewrite
+                // identical dep-info and invalidate artifact snapshot timestamps.
+                let mut outfile = Vec::new();
                 write!(outfile, "{}:", target_fn)?;
                 for dep in &deps {
                     write!(outfile, " {}", dep)?;
                 }
                 writeln!(outfile)?;
+                paths::write_if_changed(output_path, outfile)?;
 
             // dep-info generation failed, so delete output file. This will
             // usually cause the build system to always rerun the build

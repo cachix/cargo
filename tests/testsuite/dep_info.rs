@@ -165,6 +165,25 @@ fn no_rewrite_if_no_change() {
     );
 }
 
+#[cargo_test]
+fn no_rewrite_if_escaped_paths_are_unchanged() {
+    let p = project()
+        .at(paths::root().join("project with spaces"))
+        .file("src/lib.rs", "pub fn value() -> u8 { 1 }")
+        .build();
+    p.cargo("build").run();
+    let dep_info = p.root().join("target/debug/libfoo.d");
+    let original = std::fs::read(&dep_info).unwrap();
+    let timestamp = FileTime::from_unix_time(1_000_000, 123_456_789);
+    filetime::set_file_mtime(&dep_info, timestamp).unwrap();
+    p.cargo("build").run();
+    assert_eq!(std::fs::read(&dep_info).unwrap(), original);
+    assert_eq!(
+        FileTime::from_last_modification_time(&dep_info.metadata().unwrap()),
+        timestamp
+    );
+}
+
 #[cargo_test(nightly, reason = "-Z binary-dep-depinfo is unstable")]
 fn relative_depinfo_paths_ws() {
     // Test relative dep-info paths in a workspace with --target with

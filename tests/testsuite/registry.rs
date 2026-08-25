@@ -14,7 +14,7 @@ use cargo_test_support::paths;
 use cargo_test_support::registry::{
     self, Dependency, Package, RegistryBuilder, Response, TestRegistry, registry_path,
 };
-use cargo_test_support::{basic_manifest, project, str};
+use cargo_test_support::{basic_bin_manifest, basic_manifest, project, str};
 use cargo_test_support::{git, t};
 use cargo_util::paths::remove_dir_all;
 
@@ -104,6 +104,1058 @@ fn simple(pre_clean_expected: impl IntoData, post_clean_expected: impl IntoData)
 
     // Don't download a second time
     p.cargo("check").with_stderr_data(post_clean_expected).run();
+}
+
+#[cargo_test]
+fn casita_storage_routes_registry_and_build_artifacts() {
+    // `dirs::data_dir` honors XDG_DATA_HOME on Linux. Keep the Casita default
+    // repository used by this test inside the test sandbox on that platform.
+    if !crate::casita_available() {
+        return;
+    }
+
+    let _server = setup_http();
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.0.1"
+                edition = "2015"
+                authors = []
+
+                [dependencies]
+                bar = "0.0.1"
+            "#,
+        )
+        .file("src/main.rs", "fn main() {}")
+        .file(
+            ".cargo/config.toml",
+            r#"
+                [cache]
+                storage = "casita"
+            "#,
+        )
+        .build();
+
+    Package::new("bar", "0.0.1").publish();
+
+    let casita_data_dir = tempfile::tempdir_in(paths::root()).unwrap();
+    let casita_data = casita_data_dir.path();
+    let mut command = p.cargo("build -Zcasita-storage");
+    command
+        .masquerade_as_nightly_cargo(&["casita-storage"])
+        .env("XDG_DATA_HOME", &casita_data)
+        .run();
+
+    let output = p
+        .cargo("build --offline -Zcasita-storage")
+        .masquerade_as_nightly_cargo(&["casita-storage"])
+        .env("XDG_DATA_HOME", &casita_data)
+        .env("CARGO_LOG", "cargo::context::casita=debug")
+        .exec_with_output()
+        .unwrap();
+    let diagnostics = String::from_utf8(output.stderr).unwrap();
+    assert!(diagnostics.contains("Casita snapshot unchanged"));
+    assert!(
+        !diagnostics.contains("root=\"artifact.import\""),
+        "{diagnostics}"
+    );
+
+    // Delete Cargo's unpacked registry sources. The next process must restore
+    // the archive from Casita and extract it again without a network request.
+    let registry_sources = paths::cargo_home().join("registry/src");
+    remove_dir_all(&registry_sources).unwrap();
+    assert!(!registry_sources.exists());
+
+    // A second Cargo process must restore both caches from Casita checkouts.
+    let mut command = p.cargo("build -Zcasita-storage");
+    command
+        .masquerade_as_nightly_cargo(&["casita-storage"])
+        .env("XDG_DATA_HOME", &casita_data)
+        .arg("--offline")
+        .run();
+
+    assert!(paths::cargo_home().join("registry/cache").exists());
+    assert!(!p.root().join("target").exists());
+
+    let repository = casita_data.join("casita");
+    assert!(repository.join("casita.sqlite").exists());
+    assert!(repository.join("blobs").exists());
+    assert!(!repository.join("cargo").exists());
+
+    // `clean` must import the now-empty checkout. A subsequent process should
+    // therefore rebuild instead of recovering the pre-clean artifacts.
+    let mut command = p.cargo("clean -Zcasita-storage");
+    command
+        .masquerade_as_nightly_cargo(&["casita-storage"])
+        .env("XDG_DATA_HOME", &casita_data)
+        .run();
+
+    let mut command = p.cargo("build --offline -Zcasita-storage");
+    command
+        .masquerade_as_nightly_cargo(&["casita-storage"])
+        .env("XDG_DATA_HOME", &casita_data)
+        .with_stderr_contains("[COMPILING] bar v0.0.1")
+        .with_stderr_contains("[COMPILING] foo v0.0.1 ([ROOT]/foo)")
+        .run();
+}
+
+#[cargo_test]
+#[cfg(unix)]
+fn casita_storage_preserves_precise_timestamps() {
+    use filetime::{FileTime, set_file_mtime, set_symlink_file_times};
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::MetadataExt as _;
+
+    if !crate::casita_available() {
+        return;
+    }
+    let p = project()
+        .file("Cargo.toml", &basic_manifest("foo", "0.0.1"))
+        .file("src/lib.rs", "pub fn value() -> u32 { 42 }")
+        .file(
+            "build.rs",
+            r#"
+            fn main() {
+                let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+                let generated = out.join("generated");
+                std::fs::create_dir_all(&generated).unwrap();
+                std::fs::write(generated.join("value"), "42").unwrap();
+                let target = std::env::var("CARGO_TARGET_DIR").unwrap();
+                println!("cargo::rerun-if-changed={target}/timestamps");
+            }
+        "#,
+        )
+        .file(".cargo/config.toml", "[cache]\nstorage = \"casita\"\n")
+        .file("external", "outside the snapshot")
+        .build();
+    let target = p.root().join("output");
+    let directory = target.join("timestamps");
+    fs::create_dir_all(&directory).unwrap();
+    let file = directory.join(std::ffi::OsStr::from_bytes(b"non-utf8-\xff"));
+    fs::write(&file, "timestamped artifact").unwrap();
+    let external = p.root().join("external");
+    let link = directory.join("link");
+    std::os::unix::fs::symlink(&external, &link).unwrap();
+    let timestamp = FileTime::from_unix_time(1_600_000_000, 123_456_789);
+    set_file_mtime(&file, timestamp).unwrap();
+    set_symlink_file_times(&link, timestamp, timestamp).unwrap();
+    set_file_mtime(&directory, timestamp).unwrap();
+    let repository = tempfile::tempdir_in(paths::root()).unwrap();
+    let run = |args: &str| {
+        let mut command = p.cargo(args);
+        command
+            .masquerade_as_nightly_cargo(&["casita-storage"])
+            .env("XDG_DATA_HOME", repository.path())
+            .env("CARGO_TARGET_DIR", &target);
+        command
+    };
+    let identity = fs::metadata(&file).unwrap();
+    run("build -Zcasita-storage").run();
+    let imported = fs::metadata(&file).unwrap();
+    assert_eq!(
+        (identity.ino(), identity.ctime(), identity.ctime_nsec()),
+        (imported.ino(), imported.ctime(), imported.ctime_nsec()),
+        "snapshot publication must preserve unchanged file cache identities"
+    );
+    for path in [&file, &link, &directory] {
+        assert_eq!(
+            FileTime::from_last_modification_time(&fs::symlink_metadata(path).unwrap()),
+            timestamp
+        );
+    }
+    remove_dir_all(&target).unwrap();
+    let external_time = FileTime::from_unix_time(1_700_000_000, 987_654_321);
+    set_file_mtime(&external, external_time).unwrap();
+    run("clean --dry-run -Zcasita-storage").run();
+    for path in [&file, &link, &directory] {
+        assert_eq!(
+            FileTime::from_last_modification_time(&fs::symlink_metadata(path).unwrap()),
+            timestamp
+        );
+    }
+    assert_eq!(
+        FileTime::from_last_modification_time(&fs::metadata(&external).unwrap()),
+        external_time
+    );
+    run("build -v -Zcasita-storage")
+        .with_stderr_contains("[FRESH] foo v0.0.1 ([ROOT]/foo)")
+        .with_stderr_does_not_contain("[COMPILING] [..]")
+        .run();
+
+    let retained = || {
+        let output = p
+            .process("casita")
+            .arg("--repository")
+            .arg(repository.path().join("casita"))
+            .args(&["root", "ls", "cargo/native"])
+            .exec_with_output()
+            .unwrap();
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains("/filesystem/"))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let previous = retained();
+    assert_eq!(previous.len(), 1);
+    fs::write(&file, "edited artifact with preserved mtime").unwrap();
+    set_file_mtime(&file, timestamp).unwrap();
+    run("build -Zcasita-storage").run();
+    let current = retained();
+    assert_eq!(current.len(), 1, "superseded filesystem roots leaked");
+    assert_ne!(previous, current);
+    remove_dir_all(&target).unwrap();
+    run("clean --dry-run -Zcasita-storage").run();
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        "edited artifact with preserved mtime"
+    );
+}
+
+#[cargo_test]
+fn casita_storage_restores_legacy_snapshots() {
+    casita_legacy_snapshot(false);
+}
+
+#[cargo_test]
+fn casita_storage_restores_v1_snapshots() {
+    casita_legacy_snapshot(true);
+}
+
+fn casita_legacy_snapshot(version_one: bool) {
+    if !crate::casita_available() {
+        return;
+    }
+    let p = project()
+        .file("Cargo.toml", &basic_manifest("foo", "0.0.1"))
+        .file("src/lib.rs", "pub fn value() -> u32 { 42 }")
+        .file(".cargo/config.toml", "[cache]\nstorage = \"casita\"\n")
+        .build();
+    let repository = tempfile::tempdir_in(paths::root()).unwrap();
+    let legacy = paths::root().join("legacy");
+    fs::create_dir_all(&legacy).unwrap();
+    let data = if version_one {
+        legacy.join("data")
+    } else {
+        legacy.clone()
+    };
+    fs::create_dir_all(&data).unwrap();
+    fs::write(data.join("legacy-marker"), "old snapshot").unwrap();
+    if version_one {
+        let entries = [b"".as_slice(), b"legacy-marker\0".as_slice()]
+            .into_iter()
+            .map(|path| {
+                (
+                    blake3::hash(path).to_hex().to_string(),
+                    serde_json::json!({"seconds": 1, "nanos": 42}),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        fs::write(
+            legacy.join("timestamps.json"),
+            serde_json::to_vec(&serde_json::json!({"entries": entries})).unwrap(),
+        )
+        .unwrap();
+    }
+    let manifest = fs::canonicalize(p.root().join("Cargo.toml")).unwrap();
+    let root = format!(
+        "cargo/workspaces/{}/target",
+        cargo::util::hex::short_hash(&manifest)
+    );
+    let root = if version_one {
+        format!(
+            "cargo/snapshots/v1/{}",
+            root.strip_prefix("cargo/").unwrap()
+        )
+    } else {
+        root
+    };
+    p.process("casita")
+        .arg("--repository")
+        .arg(repository.path().join("casita"))
+        .arg("import")
+        .arg(&legacy)
+        .arg("--root")
+        .arg(&root)
+        .run();
+    let checkouts = paths::root().join("checkouts");
+    fs::create_dir_all(&checkouts).unwrap();
+    let run = |args: &str| {
+        let mut command = p.cargo(args);
+        command
+            .masquerade_as_nightly_cargo(&["casita-storage"])
+            .env("XDG_DATA_HOME", repository.path())
+            .env("TMPDIR", &checkouts);
+        command
+    };
+    run("build -Zcasita-storage").run();
+    remove_dir_all(&checkouts).unwrap();
+    fs::create_dir_all(&checkouts).unwrap();
+    run("clean --dry-run -Zcasita-storage").run();
+    let restored = walkdir::WalkDir::new(&checkouts)
+        .into_iter()
+        .map(|entry| entry.unwrap().into_path())
+        .collect::<Vec<_>>();
+    assert!(
+        restored
+            .iter()
+            .any(|path| path.file_name().unwrap() == "legacy-marker")
+    );
+    assert!(
+        restored
+            .iter()
+            .any(|path| path.file_name().unwrap() == "libfoo.rlib")
+    );
+    run("clean -Zcasita-storage").run();
+    remove_dir_all(&checkouts).unwrap();
+    fs::create_dir_all(&checkouts).unwrap();
+    run("clean --dry-run -Zcasita-storage").run();
+    assert!(
+        !walkdir::WalkDir::new(&checkouts)
+            .into_iter()
+            .any(|entry| entry.unwrap().file_name() == "legacy-marker")
+    );
+}
+
+#[cargo_test]
+fn casita_storage_restores_default_rlibs() {
+    if !crate::casita_available() {
+        return;
+    }
+    for separate_build_dir in [false, true] {
+        let p = project()
+            .file(
+                "Cargo.toml",
+                &format!(
+                    "{}\n[dependencies]\nbar = {{ path = \"bar\" }}",
+                    basic_manifest("foo", "0.0.1")
+                ),
+            )
+            .file("bar/Cargo.toml", &basic_manifest("bar", "0.0.1"))
+            .file(
+                "bar/src/lib.rs",
+                r#"include!(concat!(env!("OUT_DIR"), "/value.rs"));"#,
+            )
+            .file(
+                "bar/build.rs",
+                r#"
+                fn main() {
+                    let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+                    std::fs::write(out.join("value.rs"), "pub fn value() -> u32 { 42 }").unwrap();
+                    println!("cargo::rerun-if-changed=build.rs");
+                }
+            "#,
+            )
+            .file(
+                "src/lib.rs",
+                "extern crate bar; pub fn value() -> u32 { bar::value() }",
+            )
+            .file(".cargo/config.toml", "[cache]\nstorage = \"casita\"\n")
+            .build();
+        let repository_dir = tempfile::tempdir_in(paths::root()).unwrap();
+        let repository = repository_dir.path();
+        let checkouts = paths::root().join("checkouts");
+        fs::create_dir_all(&checkouts).unwrap();
+        let intermediates = p.root().join("intermediates");
+        let run = |args: &str| {
+            let mut command = p.cargo(args);
+            command
+                .masquerade_as_nightly_cargo(&["casita-storage"])
+                .env("XDG_DATA_HOME", &repository)
+                .env("TMPDIR", &checkouts);
+            if separate_build_dir {
+                command.env("CARGO_BUILD_BUILD_DIR", &intermediates);
+            }
+            command
+        };
+        let rlibs = || {
+            let mut artifacts = [&checkouts, &intermediates]
+                .into_iter()
+                .filter(|path| path.exists())
+                .flat_map(walkdir::WalkDir::new)
+                .map(|entry| entry.unwrap().into_path())
+                .filter(|path| {
+                    path.extension()
+                        .is_some_and(|extension| extension == "rlib")
+                })
+                .map(|path| {
+                    (
+                        path.file_name().unwrap().to_owned(),
+                        blake3::hash(&fs::read(&path).unwrap()).to_hex().to_string(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            artifacts.sort();
+            artifacts
+        };
+        run("build -Zcasita-storage").run();
+        let before = rlibs();
+        assert!(!before.is_empty());
+        remove_dir_all(&checkouts).unwrap();
+        if intermediates.exists() {
+            remove_dir_all(&intermediates).unwrap();
+        }
+        fs::create_dir_all(&checkouts).unwrap();
+        run("clean --dry-run -Zcasita-storage").run();
+        assert_eq!(rlibs(), before);
+        run("build -v -Zcasita-storage")
+            .with_stderr_contains("[FRESH] bar v0.0.1 ([ROOT]/foo/bar)")
+            .with_stderr_contains("[FRESH] foo v0.0.1 ([ROOT]/foo)")
+            .with_stderr_does_not_contain("[COMPILING] [..]")
+            .run();
+        p.change_file("bar/src/lib.rs", "pub fn value() -> u32 { 43 }");
+        run("build -v -Zcasita-storage")
+            .with_stderr_contains("[COMPILING] bar v0.0.1 ([ROOT]/foo/bar)")
+            .with_stderr_contains("[COMPILING] foo v0.0.1 ([ROOT]/foo)")
+            .run();
+        remove_dir_all(&checkouts).unwrap();
+    }
+}
+
+#[cargo_test]
+fn casita_storage_restores_rlibs_in_custom_layouts() {
+    if !crate::casita_available() {
+        return;
+    }
+    for (target, build) in [
+        ("target", "target"),
+        ("target", "intermediates"),
+        ("target", "target/intermediates"),
+        ("intermediates/target", "intermediates"),
+    ] {
+        let p = project()
+            .file("Cargo.toml", &format!("{}\n[dependencies]\nbar = {{ path = \"bar\" }}", basic_manifest("foo", "0.0.1")))
+        .file("bar/Cargo.toml", &basic_manifest("bar", "0.0.1"))
+        .file("bar/src/lib.rs", "pub fn value() -> u32 { 42 }")
+            .file("src/lib.rs", "extern crate bar; pub fn value() -> u32 { bar::value() }")
+            .file(
+                ".cargo/config.toml",
+                &format!(
+                    "[cache]\nstorage = \"casita\"\n[build]\ntarget-dir = {target:?}\nbuild-dir = {build:?}\n"
+                ),
+            )
+            .build();
+        let repository_dir = tempfile::tempdir_in(paths::root()).unwrap();
+        let repository = repository_dir.path();
+        let run = |args: &str| {
+            let mut command = p.cargo(args);
+            command
+                .masquerade_as_nightly_cargo(&["casita-storage"])
+                .env("XDG_DATA_HOME", &repository);
+            command
+        };
+        run("build -Zcasita-storage").run();
+        let target = p.root().join(target);
+        let build = p.root().join(build);
+        let rlib = walkdir::WalkDir::new(&build)
+            .into_iter()
+            .map(|entry| entry.unwrap().into_path())
+            .find(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "rlib")
+                    && path
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("libbar")
+            })
+            .expect("compiled rlib");
+        let digest = blake3::hash(&fs::read(&rlib).unwrap());
+        let delete_outputs = || {
+            for dir in [&target, &build] {
+                if dir.exists() {
+                    remove_dir_all(dir).unwrap();
+                }
+            }
+        };
+        delete_outputs();
+        fs::create_dir_all(if target.starts_with(&build) {
+            &build
+        } else {
+            &target
+        })
+        .unwrap();
+        run("clean --dry-run -Zcasita-storage").run();
+        assert_eq!(blake3::hash(&fs::read(&rlib).unwrap()), digest);
+        assert!(target.join("debug/libfoo.rlib").exists());
+        run("build -v -Zcasita-storage")
+            .with_stderr_contains("[FRESH] bar v0.0.1 ([ROOT]/foo/bar)")
+            .with_stderr_contains("[FRESH] foo v0.0.1 ([ROOT]/foo)")
+            .run();
+        delete_outputs();
+        run("clean --dry-run -Zcasita-storage")
+            .arg("--config")
+            .arg("build.build-dir=\"other\"")
+            .run();
+        assert!(!target.join("debug/libfoo.rlib").exists());
+        run("clean --dry-run -Zcasita-storage").run();
+        assert_eq!(blake3::hash(&fs::read(&rlib).unwrap()), digest);
+        fs::write(target.join("local-state"), "keep me").unwrap();
+        run("build -Zcasita-storage").run();
+        assert_eq!(
+            fs::read_to_string(target.join("local-state")).unwrap(),
+            "keep me"
+        );
+        run("clean -Zcasita-storage").run();
+        delete_outputs();
+        run("clean --dry-run -Zcasita-storage").run();
+        assert!(!rlib.exists());
+    }
+}
+
+#[cargo_test]
+fn casita_storage_persists_failed_build_outputs() {
+    if !crate::casita_available() {
+        return;
+    }
+    let p = project()
+        .file("Cargo.toml", &basic_manifest("foo", "0.0.1"))
+        .file("src/lib.rs", "pub fn value() -> u32 { 42 }")
+        .file("src/main.rs", "fn main() { foo::missing(); }")
+        .file(".cargo/config.toml", "[cache]\nstorage = \"casita\"\n")
+        .build();
+    let target = p.root().join("output");
+    let repository_dir = tempfile::tempdir_in(paths::root()).unwrap();
+    let repository = repository_dir.path();
+    let run = |args: &str| {
+        let mut command = p.cargo(args);
+        command
+            .masquerade_as_nightly_cargo(&["casita-storage"])
+            .env("XDG_DATA_HOME", &repository)
+            .env("CARGO_TARGET_DIR", &target);
+        command
+    };
+    run("build -Zcasita-storage")
+        .with_status(101)
+        .with_stderr_contains("[..]cannot find function `missing` in crate `foo`[..]")
+        .run();
+    let rlib = target.join("debug/libfoo.rlib");
+    let digest = blake3::hash(&fs::read(&rlib).unwrap());
+    remove_dir_all(&target).unwrap();
+    run("clean --dry-run -Zcasita-storage").run();
+    assert_eq!(blake3::hash(&fs::read(&rlib).unwrap()), digest);
+    p.change_file(
+        "build.rs",
+        r#"
+        fn main() {
+            let path = std::path::PathBuf::from(std::env::var_os("CARGO_TARGET_DIR").unwrap());
+            use std::os::unix::fs::PermissionsExt;
+            let unreadable = path.join("unreadable");
+            std::fs::write(&unreadable, "cannot import").unwrap();
+            std::fs::set_permissions(unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+    "#,
+    );
+    run("build -Zcasita-storage")
+        .with_status(101)
+        .with_stderr_contains("[..]cannot find function `missing` in crate `foo`[..]")
+        .with_stderr_contains("[WARNING] could not persist workspace artifacts:[..]")
+        .run();
+}
+
+#[cargo_test]
+fn casita_storage_restores_sparse_registry_sources() {
+    casita_registry_roundtrip(true);
+}
+
+#[cargo_test]
+fn casita_storage_restores_git_registry_sources() {
+    casita_registry_roundtrip(false);
+}
+
+fn casita_registry_roundtrip(sparse: bool) {
+    if !crate::casita_available() {
+        return;
+    }
+    let builder = RegistryBuilder::new();
+    let registry = if sparse {
+        builder.http_index()
+    } else {
+        builder
+    }
+    .build();
+    Package::new("bar", "0.0.1")
+        .file("src/lib.rs", "")
+        .file("edited", "original")
+        .file("removed", "original")
+        .publish();
+    let p = project()
+        .file(
+            "Cargo.toml",
+            &format!(
+                "{}\n[dependencies]\nbar = \"0.0.1\"",
+                basic_manifest("foo", "0.0.1")
+            ),
+        )
+        .file("src/lib.rs", "extern crate bar;")
+        .file(".cargo/config.toml", "[cache]\nstorage = \"casita\"\n")
+        .build();
+    let repository = tempfile::tempdir_in(paths::root()).unwrap();
+    let checkouts = paths::root().join("checkouts");
+    fs::create_dir_all(&checkouts).unwrap();
+    let run = |args: &str| {
+        let mut command = p.cargo(args);
+        command
+            .masquerade_as_nightly_cargo(&["casita-storage"])
+            .env("XDG_DATA_HOME", repository.path())
+            .env("TMPDIR", &checkouts);
+        command
+    };
+    run("fetch -Zcasita-storage").run();
+    let first_archive = p
+        .process("casita")
+        .arg("--repository")
+        .arg(repository.path().join("casita"))
+        .args(&["root", "ls", "cargo/snapshots/v2/registry/archive"])
+        .exec_with_output()
+        .unwrap();
+    let first_archive = String::from_utf8(first_archive.stdout).unwrap();
+    assert_eq!(first_archive.lines().count(), 1);
+    let source = walkdir::WalkDir::new(paths::cargo_home().join("registry/src"))
+        .into_iter()
+        .map(|entry| entry.unwrap().into_path())
+        .find(|path| path.file_name().unwrap() == "bar-0.0.1")
+        .unwrap();
+    let marker = source.join("casita-roundtrip");
+    fs::write(&marker, "stored source checkout").unwrap();
+    fs::write(source.join("edited"), "local edit").unwrap();
+    fs::remove_file(source.join("removed")).unwrap();
+    Package::new("baz", "0.0.1").publish();
+    p.change_file(
+        "Cargo.toml",
+        &format!(
+            "{}\n[dependencies]\nbar = \"0.0.1\"\nbaz = \"0.0.1\"",
+            basic_manifest("foo", "0.0.1")
+        ),
+    );
+    run("fetch -Zcasita-storage").run();
+    let archive = walkdir::WalkDir::new(paths::cargo_home().join("registry/cache"))
+        .into_iter()
+        .map(|e| e.unwrap().into_path())
+        .find(|path| path.file_name().unwrap() == "bar-0.0.1.crate")
+        .unwrap();
+    let digest = blake3::hash(&fs::read(&archive).unwrap());
+    let archive_mtime =
+        filetime::FileTime::from_last_modification_time(&fs::metadata(&archive).unwrap());
+    let native_roots = p
+        .process("casita")
+        .arg("--repository")
+        .arg(repository.path().join("casita"))
+        .args(&["root", "ls", "cargo/native"])
+        .exec_with_output()
+        .unwrap();
+    let native_roots = String::from_utf8(native_roots.stdout).unwrap();
+    assert!(native_roots.contains("/blob/"));
+    assert!(native_roots.contains("/tar/"));
+    let archive_roots = p
+        .process("casita")
+        .arg("--repository")
+        .arg(repository.path().join("casita"))
+        .args(&["root", "ls", "cargo/snapshots/v2/registry/archive"])
+        .exec_with_output()
+        .unwrap();
+    let archive_roots = String::from_utf8(archive_roots.stdout).unwrap();
+    assert_eq!(archive_roots.lines().count(), 2);
+    assert!(
+        archive_roots
+            .lines()
+            .any(|line| line == first_archive.trim()),
+        "persisting the second archive rewrote the first snapshot"
+    );
+    let snapshots = p
+        .process("casita")
+        .arg("--repository")
+        .arg(repository.path().join("casita"))
+        .args(&["root", "ls", "cargo/snapshots/v2/registry/src"])
+        .exec_with_output()
+        .unwrap();
+    let snapshots = String::from_utf8(snapshots.stdout).unwrap();
+    let line = snapshots
+        .lines()
+        .find(|line| line.ends_with("/bar-0.0.1"))
+        .unwrap();
+    let exported = paths::root().join("exported-snapshot");
+    p.process("casita")
+        .arg("--repository")
+        .arg(repository.path().join("casita"))
+        .arg("checkout")
+        .arg(line.split_whitespace().next().unwrap())
+        .arg(&exported)
+        .arg("--no-root")
+        .run();
+    let native: serde_json::Value =
+        serde_json::from_slice(&fs::read(exported.join("native.json")).unwrap()).unwrap();
+    assert_eq!(native[0]["importer"], "tar");
+    assert!(!native[0]["paths"].as_array().unwrap().is_empty());
+    assert!(exported.join("data/.cargo-ok").is_file());
+    assert_eq!(
+        fs::read_to_string(exported.join("data/edited")).unwrap(),
+        "local edit"
+    );
+    assert!(!exported.join("data/removed").exists());
+    p.process("casita")
+        .arg("--repository")
+        .arg(repository.path().join("casita"))
+        .arg("gc")
+        .run();
+    registry.join();
+    remove_dir_all(paths::cargo_home().join("registry")).unwrap();
+    remove_dir_all(&checkouts).unwrap();
+    fs::create_dir_all(&checkouts).unwrap();
+    fs::remove_file(p.root().join("Cargo.lock")).unwrap();
+    run("generate-lockfile --offline -Zcasita-storage").run();
+    run("fetch --offline -Zcasita-storage").run();
+    assert_eq!(
+        fs::read_to_string(&marker).unwrap(),
+        "stored source checkout"
+    );
+    assert_eq!(
+        fs::read_to_string(source.join("edited")).unwrap(),
+        "local edit"
+    );
+    assert!(!source.join("removed").exists());
+    let archive = walkdir::WalkDir::new(paths::cargo_home().join("registry/cache"))
+        .into_iter()
+        .map(|e| e.unwrap().into_path())
+        .find(|path| path.file_name().unwrap() == "bar-0.0.1.crate")
+        .unwrap();
+    assert_eq!(blake3::hash(&fs::read(&archive).unwrap()), digest);
+    assert_eq!(
+        filetime::FileTime::from_last_modification_time(&fs::metadata(&archive).unwrap()),
+        archive_mtime
+    );
+    assert!(paths::cargo_home().join("registry/index").is_dir());
+    assert!(paths::cargo_home().join("registry/cache").exists());
+    run("check --offline -Zcasita-storage").run();
+    p.process("casita")
+        .arg("--repository")
+        .arg(repository.path().join("casita"))
+        .args(&["root", "rm", native[0]["root"].as_str().unwrap()])
+        .run();
+    remove_dir_all(paths::cargo_home().join("registry/src")).unwrap();
+    run("fetch --offline -Zcasita-storage")
+        .with_status(101)
+        .with_stderr_contains("[..]Casita snapshot references missing root[..]")
+        .run();
+}
+
+#[cargo_test]
+fn casita_storage_prunes_legacy_roots_only_after_last_reference() {
+    if !crate::casita_available() {
+        return;
+    }
+    let _server = setup_http();
+    Package::new("bar", "0.0.1").publish();
+    let p = project()
+        .file(
+            "Cargo.toml",
+            &format!(
+                "{}\n[dependencies]\nbar = \"0.0.1\"",
+                basic_manifest("foo", "0.0.1")
+            ),
+        )
+        .file("src/lib.rs", "")
+        .file(".cargo/config.toml", "[cache]\nstorage = \"casita\"\n")
+        .build();
+    let repository = tempfile::tempdir_in(paths::root()).unwrap();
+    let casita = || {
+        let mut cmd = p.process("casita");
+        cmd.arg("--repository")
+            .arg(repository.path().join("casita"));
+        cmd
+    };
+    let kept = format!("cargo/objects/blobs/{}", "1".repeat(64));
+    let orphan = format!("cargo/objects/blobs/{}", "2".repeat(64));
+    let payload = paths::root().join("legacy-payload");
+    fs::create_dir_all(&payload).unwrap();
+    fs::write(payload.join("bytes"), "retained bytes").unwrap();
+    for root in [&kept, &orphan] {
+        casita()
+            .arg("import")
+            .arg(&payload)
+            .args(&["--root", root])
+            .run();
+    }
+    casita()
+        .arg("import")
+        .arg(&payload)
+        .args(&["--root", "git/a user view"])
+        .run();
+    let envelope = paths::root().join("legacy-envelope");
+    fs::create_dir_all(&envelope).unwrap();
+    fs::write(
+        envelope.join("native.json"),
+        serde_json::to_vec(&serde_json::json!([
+            {"importer": "blob", "root": kept, "paths": []}
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    let snapshots = ["cargo/snapshots/v2/test/one", "cargo/snapshots/v2/test/two"];
+    for root in snapshots {
+        casita()
+            .arg("import")
+            .arg(&envelope)
+            .args(&["--root", root])
+            .run();
+    }
+    let run = || {
+        p.cargo("fetch -Zcasita-storage")
+            .masquerade_as_nightly_cargo(&["casita-storage"])
+            .env("XDG_DATA_HOME", repository.path())
+            .run();
+    };
+    let roots = || {
+        String::from_utf8(
+            casita()
+                .args(&["root", "ls", "cargo/objects"])
+                .exec_with_output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+    };
+    run();
+    assert!(roots().contains(&kept));
+    assert!(!roots().contains(&orphan));
+    casita().args(&["root", "rm", snapshots[0]]).run();
+    run();
+    assert!(
+        roots().contains(&kept),
+        "a shared legacy root was released too early"
+    );
+    casita().args(&["root", "rm", snapshots[1]]).run();
+    run();
+    assert!(roots().is_empty(), "unreferenced legacy roots leaked");
+}
+
+#[cargo_test]
+fn casita_storage_migrates_whole_archive_cache() {
+    if !crate::casita_available() {
+        return;
+    }
+    let registry = setup_http();
+    Package::new("bar", "0.0.1").publish();
+    let p = project()
+        .file(
+            "Cargo.toml",
+            &format!(
+                "{}\n[dependencies]\nbar = \"0.0.1\"",
+                basic_manifest("foo", "0.0.1")
+            ),
+        )
+        .file("src/lib.rs", "extern crate bar;")
+        .build();
+    p.cargo("fetch").run();
+    registry.join();
+    let repository = tempfile::tempdir_in(paths::root()).unwrap();
+    p.process("casita")
+        .arg("--repository")
+        .arg(repository.path().join("casita"))
+        .arg("import")
+        .arg(paths::cargo_home().join("registry/cache"))
+        .args(&["--root", "cargo/registry/archives"])
+        .run();
+    remove_dir_all(paths::cargo_home().join("registry/cache")).unwrap();
+    remove_dir_all(paths::cargo_home().join("registry/src")).unwrap();
+    p.change_file(".cargo/config.toml", "[cache]\nstorage = \"casita\"\n");
+    p.cargo("fetch --offline -Zcasita-storage")
+        .masquerade_as_nightly_cargo(&["casita-storage"])
+        .env("XDG_DATA_HOME", repository.path())
+        .run();
+    let roots = p
+        .process("casita")
+        .arg("--repository")
+        .arg(repository.path().join("casita"))
+        .args(&["root", "ls", "cargo"])
+        .exec_with_output()
+        .unwrap();
+    let roots = String::from_utf8(roots.stdout).unwrap();
+    assert!(
+        !roots
+            .lines()
+            .any(|line| line.ends_with("cargo/registry/archives"))
+    );
+    assert!(roots.contains("cargo/snapshots/v2/registry/archive/"));
+    remove_dir_all(paths::cargo_home().join("registry")).unwrap();
+    p.cargo("check --offline -Zcasita-storage")
+        .masquerade_as_nightly_cargo(&["casita-storage"])
+        .env("XDG_DATA_HOME", repository.path())
+        .run();
+}
+
+#[cargo_test]
+fn casita_storage_restores_only_requested_archives() {
+    if !crate::casita_available() {
+        return;
+    }
+    Package::new("bar", "0.0.1")
+        .file("src/lib.rs", "pub fn value() -> u8 { 1 }")
+        .publish();
+    Package::new("bar", "0.0.2").publish();
+    Package::new("baz", "0.0.1").publish();
+    let p = project()
+        .file(
+            "Cargo.toml",
+            &format!(
+                "{}\n[dependencies]\nbar = \"0.0.1\"\nbaz = \"0.0.1\"",
+                basic_manifest("foo", "0.0.1")
+            ),
+        )
+        .file("src/lib.rs", "")
+        .file(".cargo/config.toml", "[cache]\nstorage = \"casita\"\n")
+        .build();
+    let repository = tempfile::tempdir_in(paths::root()).unwrap();
+    let run = |args: &str| {
+        let mut command = p.cargo(args);
+        command
+            .masquerade_as_nightly_cargo(&["casita-storage"])
+            .env("XDG_DATA_HOME", repository.path());
+        command
+    };
+    run("fetch -Zcasita-storage").run();
+    p.change_file(
+        "Cargo.toml",
+        &format!(
+            "{}\n[dependencies]\nbar = \">=0.0.1\"",
+            basic_manifest("foo", "0.0.1")
+        ),
+    );
+    let archives = paths::cargo_home().join("registry/cache");
+    remove_dir_all(&archives).unwrap();
+    fs::remove_file(p.root().join("Cargo.lock")).unwrap();
+    run("fetch --offline -Zcasita-storage").run();
+    let names = walkdir::WalkDir::new(&archives)
+        .into_iter()
+        .map(|entry| entry.unwrap())
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "crate"))
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["bar-0.0.1.crate"]);
+    let source = walkdir::WalkDir::new(paths::cargo_home().join("registry/src"))
+        .into_iter()
+        .map(|entry| entry.unwrap().into_path())
+        .find(|path| path.ends_with("bar-0.0.1/src/lib.rs"))
+        .unwrap();
+    let mtime = filetime::FileTime::from_last_modification_time(&source.metadata().unwrap());
+    fs::write(&source, "pub fn value() -> u8 { 2 }").unwrap();
+    filetime::set_file_mtime(&source, mtime).unwrap();
+    run("fetch --offline -Zcasita-storage").run();
+    remove_dir_all(paths::cargo_home().join("registry/src")).unwrap();
+    run("fetch --offline -Zcasita-storage").run();
+    assert_eq!(
+        fs::read_to_string(source).unwrap(),
+        "pub fn value() -> u8 { 2 }"
+    );
+}
+
+#[cargo_test]
+fn casita_storage_requires_unstable_feature() {
+    let p = project()
+        .file("Cargo.toml", &basic_manifest("foo", "0.0.1"))
+        .file("src/lib.rs", "")
+        .file(
+            ".cargo/config.toml",
+            r#"
+                [cache]
+                storage = "casita"
+            "#,
+        )
+        .build();
+
+    p.cargo("check")
+        .with_status(101)
+        .with_stderr_data(str![[r#"
+[ERROR] `cache.storage = "casita"` requires the `-Zcasita-storage` unstable feature
+
+"#]])
+        .run();
+}
+
+#[cargo_test]
+fn artifact_storage_rejects_unknown_backend() {
+    let p = project()
+        .file("Cargo.toml", &basic_manifest("foo", "0.0.1"))
+        .file("src/lib.rs", "")
+        .file(
+            ".cargo/config.toml",
+            r#"
+                [cache]
+                storage = "unknown"
+            "#,
+        )
+        .build();
+
+    p.cargo("check")
+        .with_status(101)
+        .with_stderr_data(str![[r#"
+[ERROR] unsupported cache storage backend `unknown`; expected `filesystem` or `casita`
+
+"#]])
+        .run();
+}
+
+#[cargo_test]
+fn casita_storage_preserves_explicit_target_dir() {
+    if !crate::casita_available() {
+        return;
+    }
+    let p = project()
+        .file("Cargo.toml", &basic_bin_manifest("foo"))
+        .file("src/main.rs", "fn main() {}")
+        .file(
+            ".cargo/config.toml",
+            r#"
+                [cache]
+                storage = "casita"
+            "#,
+        )
+        .build();
+    let target_dir = p.root().join("explicit-target");
+
+    let repository_dir = tempfile::tempdir_in(paths::root()).unwrap();
+    let repository = repository_dir.path();
+    let mut command = p.cargo("build -Zcasita-storage");
+    command
+        .masquerade_as_nightly_cargo(&["casita-storage"])
+        .env("XDG_DATA_HOME", &repository)
+        .arg("--target-dir")
+        .arg(&target_dir)
+        .run();
+
+    assert!(
+        target_dir
+            .join("debug")
+            .join(format!("foo{}", std::env::consts::EXE_SUFFIX))
+            .exists()
+    );
+    assert!(!p.root().join("target").exists());
+    let binary = target_dir
+        .join("debug")
+        .join(format!("foo{}", std::env::consts::EXE_SUFFIX));
+    let digest = blake3::hash(&fs::read(&binary).unwrap());
+    remove_dir_all(&target_dir).unwrap();
+    p.cargo("clean --dry-run -Zcasita-storage")
+        .masquerade_as_nightly_cargo(&["casita-storage"])
+        .env("XDG_DATA_HOME", &repository)
+        .arg("--target-dir")
+        .arg(&target_dir)
+        .run();
+    assert_eq!(blake3::hash(&fs::read(&binary).unwrap()), digest);
+    for args in ["clean", "build", "clean"] {
+        p.cargo(args)
+            .arg("-Zcasita-storage")
+            .masquerade_as_nightly_cargo(&["casita-storage"])
+            .env("XDG_DATA_HOME", repository)
+            .arg("--target-dir")
+            .arg(&target_dir)
+            .run();
+    }
+    assert!(!target_dir.exists());
 }
 
 #[cargo_test]

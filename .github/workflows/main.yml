@@ -23,6 +23,7 @@ jobs:
   conclusion:
     needs:
       - build_std
+      - casita-integration
       - clippy
       - msrv
       - docs
@@ -82,6 +83,30 @@ jobs:
       - run: rustup update stable && rustup default stable
       - run: rustup component add clippy
       - run: cargo clippy --workspace --all-targets --no-deps --keep-going
+
+  casita-integration:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 1
+      CARGO_PROFILE_TEST_DEBUG: 1
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+      - run: rustup update stable && rustup default stable
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with:
+          repository: cachix/casita
+          ref: 9cf352ad6af80b260c141f4e76317b1f5884b1f3
+          path: casita-source
+      - name: Build Casita
+        run: |
+          cargo build --manifest-path casita-source/Cargo.toml -p casita --bin casita --features cli,git
+          mkdir -p "$RUNNER_TEMP/casita-bin"
+          cp casita-source/target/debug/casita "$RUNNER_TEMP/casita-bin/"
+          echo "$RUNNER_TEMP/casita-bin" >> "$GITHUB_PATH"
+          cargo clean --manifest-path casita-source/Cargo.toml
+      - run: casita --version
+      - run: cargo test -p cargo --test testsuite -- casita_storage_ --test-threads=1
 
   stale-label:
     runs-on: ubuntu-latest

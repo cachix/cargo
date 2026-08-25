@@ -782,8 +782,16 @@ The `[cache]` table defines settings for cargo's caches.
 
 Selects where Cargo stores artifacts. The default `"filesystem"` backend uses
 `$CARGO_HOME/registry/cache` for downloaded registry `.crate` archives and
-the workspace's `target` directory for build outputs. Additional backends may
-be made available through unstable Cargo features.
+the workspace's `target` directory for build outputs. The experimental
+`"casita"` backend uses the default per-user Casita repository and requires
+`-Zcasita-storage`. Cargo imports registry indexes, `.crate` archives, unpacked
+registry sources, Git databases and checkouts, and workspace target and
+intermediate build directories into Casita. Dependency sources and indexes use
+Cargo's usual cache paths as working copies and are restored when missing.
+Explicit `--target-dir`, `CARGO_TARGET_DIR`, `build.target-dir`, and
+`build.build-dir` settings still take precedence and are also persisted.
+Cargo's global-cache garbage collector can evict dependency working copies,
+but does not remove the stored Casita snapshots.
 
 #### Global caches
 
