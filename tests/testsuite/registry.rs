@@ -242,7 +242,7 @@ fn casita_storage_persists_sparse_index_once_per_resolve() {
         .count();
     assert_eq!(index_imports, 1, "{diagnostics}");
 
-    // Deferred artifacts must still be restorable offline.
+    // Everything persisted in the background must be restorable offline.
     remove_dir_all(paths::cargo_home().join("registry")).unwrap();
     p.cargo("clean -Zcasita-storage")
         .masquerade_as_nightly_cargo(&["casita-storage"])

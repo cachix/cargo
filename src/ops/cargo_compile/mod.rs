@@ -152,11 +152,10 @@ pub fn compile_with_exec<'a>(
     ws.gctx()
         .prepare_workspace_artifacts(ws.root_manifest(), &ws.target_dir(), &ws.build_dir())?;
     let compilation = compile_ws(ws, options, exec);
-    let persisted = ws.gctx().persist_workspace_artifacts(
-        ws.root_manifest(),
-        &ws.target_dir(),
-        &ws.build_dir(),
-    );
+    let persisted = ws
+        .gctx()
+        .persist_workspace_artifacts(ws.root_manifest(), &ws.target_dir(), &ws.build_dir())
+        .and_then(|()| ws.gctx().wait_for_artifact_persistence());
     let compilation = match compilation {
         Ok(compilation) => {
             persisted?;

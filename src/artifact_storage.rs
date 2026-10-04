@@ -4,7 +4,7 @@ use std::path::Path;
 
 use crate::util::{CargoResult, Filesystem};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DependencyCache {
     GitDatabase,
     GitCheckout,
@@ -88,8 +88,13 @@ pub(crate) trait ArtifactStorage {
     fn defer_persistence(&self) {}
 
     /// Ends a deferral scope. The outermost scope persists every request made
-    /// within it.
-    fn finish_deferred_persistence(&self) -> CargoResult<()> {
+    /// within it, on another thread if `background` is set.
+    fn finish_deferred_persistence(&self, _background: bool) -> CargoResult<()> {
+        Ok(())
+    }
+
+    /// Waits for persistence started in the background.
+    fn wait_for_persistence(&self) -> CargoResult<()> {
         Ok(())
     }
 }

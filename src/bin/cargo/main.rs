@@ -50,7 +50,10 @@ fn main() {
         cargo::ops::fix_exec_rustc(&gctx, &lock_addr).map_err(|e| CliError::from(e))
     } else {
         let _token = cargo::util::job::setup();
-        cli::main(&mut gctx)
+        cli::main(&mut gctx).and_then(|()| {
+            // Commands without a build still persist their downloads.
+            gctx.wait_for_artifact_persistence().map_err(CliError::from)
+        })
     };
 
     match result {

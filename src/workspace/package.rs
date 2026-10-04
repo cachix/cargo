@@ -335,7 +335,13 @@ impl<'a, 'gctx> Downloads<'a, 'gctx> {
                 .gctx
                 .acquire_package_cache_lock(CacheLockMode::DownloadExclusive)?,
         };
-        dl.run(ids).await
+        // Declared after `dl`, so an error persists before the lock is released.
+        let persistence = set.gctx.defer_artifact_persistence()?;
+        let packages = dl.run(ids).await?;
+        // Unpacked sources are not modified again, so compilation can proceed
+        // while they are persisted.
+        persistence.finish_in_background()?;
+        Ok(packages)
     }
 
     async fn run(&self, ids: impl IntoIterator<Item = PackageId>) -> CargoResult<Vec<&'a Package>> {

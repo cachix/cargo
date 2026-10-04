@@ -28,6 +28,7 @@ const IPC_MAX_FRAME_BYTES: usize = 1_048_576;
 /// out the appropriate root if the working copy is absent, then imports it when
 /// the build completes. Cargo links only a synchronous JSON-RPC client; the
 /// Casita process owns all repository and async implementation dependencies.
+#[derive(Clone)]
 pub(super) struct CasitaArtifactStorage {
     repository: PathBuf,
     archives: Filesystem,
@@ -883,6 +884,13 @@ impl CasitaArtifactStorage {
     }
 
     fn persist_requests(&self, requests: BTreeMap<String, DeferredRequest>) -> CargoResult<()> {
+        let archives = requests
+            .values()
+            .filter_map(|request| match request {
+                DeferredRequest::Archive { key, .. } => Some(key.clone()),
+                DeferredRequest::Dependency { .. } => None,
+            })
+            .collect::<BTreeSet<_>>();
         for request in requests.into_values() {
             match request {
                 DeferredRequest::Archive { key, path } => {
@@ -893,7 +901,23 @@ impl CasitaArtifactStorage {
                     cache,
                     key,
                     directory,
-                } => self.persist_dependency_now(cache, &key, &directory)?,
+                } => {
+                    if cache == DependencyCache::RegistrySource {
+                        // An interrupted deferral can leave a downloaded archive
+                        // unpersisted. Cargo will not download it again, so
+                        // persist it alongside the source unpacked from it.
+                        let archive_key = format!("{key}.crate");
+                        let archive = self.archives.as_path_unlocked().join(&archive_key);
+                        if !archives.contains(&archive_key)
+                            && archive.is_file()
+                            && !self.registry_archive_is_retained(&archive_key)?
+                        {
+                            let _lock = self.lock_repository()?;
+                            self.persist_archive_locked(&archive_key, &archive)?;
+                        }
+                    }
+                    self.persist_dependency_now(cache, &key, &directory)?;
+                }
             }
         }
         Ok(())
@@ -1253,7 +1277,7 @@ impl ArtifactStorage for CasitaArtifactStorage {
         self.with_deferred(|deferred| deferred.depth += 1);
     }
 
-    fn finish_deferred_persistence(&self) -> CargoResult<()> {
+    fn finish_deferred_persistence(&self, background: bool) -> CargoResult<()> {
         let requests = self.with_deferred(|deferred| {
             deferred.depth = deferred.depth.saturating_sub(1);
             if deferred.depth == 0 {
@@ -1262,7 +1286,34 @@ impl ArtifactStorage for CasitaArtifactStorage {
                 BTreeMap::new()
             }
         });
-        self.persist_requests(requests)
+        if requests.is_empty() {
+            return Ok(());
+        }
+        if !background {
+            return self.persist_requests(requests);
+        }
+        let storage = self.clone();
+        let handle = std::thread::Builder::new()
+            .name("cargo-casita-persist".into())
+            .spawn(move || storage.persist_requests(requests))?;
+        self.with_deferred(|deferred| deferred.background.push(handle));
+        Ok(())
+    }
+
+    fn wait_for_persistence(&self) -> CargoResult<()> {
+        let handles = self.with_deferred(|deferred| std::mem::take(&mut deferred.background));
+        let mut result = Ok(());
+        for handle in handles {
+            let joined = match handle.join() {
+                Ok(joined) => joined,
+                Err(_) => Err(anyhow::format_err!("Casita persistence thread panicked")),
+            };
+            // Wait for every thread before reporting the first failure.
+            if result.is_ok() {
+                result = joined;
+            }
+        }
+        result
     }
 }
 
@@ -1271,6 +1322,7 @@ struct DeferredPersistence {
     depth: usize,
     /// Requests keyed by Casita root.
     requests: BTreeMap<String, DeferredRequest>,
+    background: Vec<std::thread::JoinHandle<CargoResult<()>>>,
 }
 
 enum DeferredRequest {

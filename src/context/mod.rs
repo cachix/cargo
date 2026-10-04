@@ -307,8 +307,8 @@ pub struct GlobalContext {
 
 /// Scope returned by [`GlobalContext::defer_artifact_persistence`].
 ///
-/// Dropping an unfinished scope persists anyway, so artifacts written before
-/// an error are not lost.
+/// Dropping an unfinished scope persists synchronously, so artifacts written
+/// before an error are not lost.
 pub(crate) struct DeferredPersistence<'gctx> {
     gctx: &'gctx GlobalContext,
     finished: bool,
@@ -318,7 +318,18 @@ impl DeferredPersistence<'_> {
     /// Persists deferred artifacts before returning.
     pub(crate) fn finish(mut self) -> CargoResult<()> {
         self.finished = true;
-        self.gctx.artifact_storage()?.finish_deferred_persistence()
+        self.gctx
+            .artifact_storage()?
+            .finish_deferred_persistence(false)
+    }
+
+    /// Persists deferred artifacts while Cargo continues, for example while it
+    /// compiles. [`GlobalContext::wait_for_artifact_persistence`] waits for them.
+    pub(crate) fn finish_in_background(mut self) -> CargoResult<()> {
+        self.finished = true;
+        self.gctx
+            .artifact_storage()?
+            .finish_deferred_persistence(true)
     }
 }
 
@@ -330,7 +341,7 @@ impl Drop for DeferredPersistence<'_> {
         let result = self
             .gctx
             .artifact_storage()
-            .and_then(|storage| storage.finish_deferred_persistence());
+            .and_then(|storage| storage.finish_deferred_persistence(false));
         if let Err(error) = result {
             tracing::warn!("could not persist deferred artifacts: {error:#}");
         }
@@ -649,6 +660,11 @@ impl GlobalContext {
             gctx: self,
             finished: false,
         })
+    }
+
+    /// Waits for artifacts persisted in the background.
+    pub fn wait_for_artifact_persistence(&self) -> CargoResult<()> {
+        self.artifact_storage()?.wait_for_persistence()
     }
 
     /// Gets the Cargo registry source directory (`<cargo_home>/registry/src`).
