@@ -359,15 +359,46 @@ fn casita_storage_preserves_precise_timestamps() {
     fs::write(&file, "edited artifact with preserved mtime").unwrap();
     set_file_mtime(&file, timestamp).unwrap();
     run("build -Zcasita-storage").run();
+    // A small change is imported as an overlay of the retained snapshot.
     let current = retained();
-    assert_eq!(current.len(), 1, "superseded filesystem roots leaked");
-    assert_ne!(previous, current);
+    assert_eq!(current.len(), 2);
+    assert!(current.contains(&previous[0]));
     remove_dir_all(&target).unwrap();
     run("clean --dry-run -Zcasita-storage").run();
     assert_eq!(
         fs::read_to_string(&file).unwrap(),
         "edited artifact with preserved mtime"
     );
+
+    // Files removed after an overlay retained them must not be restored.
+    let removed = directory.join("removed");
+    fs::write(&removed, "removed artifact").unwrap();
+    run("build -Zcasita-storage").run();
+    fs::remove_file(&removed).unwrap();
+    run("build -Zcasita-storage").run();
+    remove_dir_all(&target).unwrap();
+    run("clean --dry-run -Zcasita-storage").run();
+    assert!(!removed.exists());
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        "edited artifact with preserved mtime"
+    );
+
+    // The overlay chain is bounded, then replaced by a full snapshot.
+    let mut generations = Vec::new();
+    for edit in 0..10 {
+        fs::write(&file, format!("edit {edit}")).unwrap();
+        run("build -Zcasita-storage").run();
+        generations.push(retained().len());
+    }
+    assert!(generations.contains(&1), "{generations:?}");
+    assert!(
+        generations.iter().all(|&roots| roots <= 9),
+        "{generations:?}"
+    );
+    remove_dir_all(&target).unwrap();
+    run("clean --dry-run -Zcasita-storage").run();
+    assert_eq!(fs::read_to_string(&file).unwrap(), "edit 9");
 }
 
 #[cargo_test]

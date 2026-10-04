@@ -21,6 +21,8 @@ use crate::util::{CargoResult, Filesystem};
 
 const IPC_VERSION: u64 = 1;
 const IPC_MAX_FRAME_BYTES: usize = 1_048_576;
+/// Overlays retained on top of a full workspace snapshot before importing a new one.
+const MAX_SNAPSHOT_OVERLAYS: usize = 8;
 
 /// Storage adapter that persists Cargo artifacts as Casita directory roots.
 ///
@@ -218,6 +220,10 @@ impl CasitaArtifactStorage {
                     {
                         native_directories.push(mapping.destination.clone());
                     }
+                    if import.merge {
+                        merge_tree(&source, &destination)?;
+                        continue;
+                    }
                     if mapping.destination.as_os_str().is_empty() {
                         // Whole-tree imports replace the empty metadata envelope.
                         // remove_dir also rejects a malformed nonempty destination.
@@ -256,7 +262,7 @@ impl CasitaArtifactStorage {
         let _timing = StorageTiming::new("snapshot.import", root);
         let checkout = checkout.as_path_unlocked();
         let stamp_path = self.stamp_path(root);
-        let previous = std::fs::read(&stamp_path)
+        let mut previous = std::fs::read(&stamp_path)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<SnapshotStamp>(&bytes).ok());
         let mut files = previous
@@ -264,7 +270,7 @@ impl CasitaArtifactStorage {
             .map(|stamp| stamp.files.clone())
             .unwrap_or_default();
         let fingerprint = snapshot_fingerprint(checkout, &mut files)?;
-        if let Some(mut stamp) = previous {
+        if let Some(stamp) = previous.as_mut() {
             // Pending Git generations may contain objects absent locally.
             let pending_git = matches!(native, Some(NativeSource::Git { .. }))
                 && self.read_native_journal(&blake3::hash(root.as_bytes()).to_hex().to_string())?
@@ -283,7 +289,7 @@ impl CasitaArtifactStorage {
                 }
                 if stamp.files != files {
                     stamp.files = files;
-                    Self::write_stamp(&stamp_path, &stamp)?;
+                    Self::write_stamp(&stamp_path, stamp)?;
                 }
                 tracing::debug!(root, "Casita snapshot unchanged");
                 return Ok(());
@@ -298,7 +304,7 @@ impl CasitaArtifactStorage {
         };
         let data = staging.path().join("data");
         let direct = native.is_none() && checkout.is_dir();
-        let timestamps = if direct {
+        let mut timestamps = if direct {
             SnapshotTimestamps::capture_inner(checkout, &data, false)?
         } else {
             SnapshotTimestamps::capture(checkout, &data)?
@@ -315,8 +321,26 @@ impl CasitaArtifactStorage {
                 Self::native_prefix(root),
                 blake3::hash(staging.path().as_os_str().as_encoded_bytes())
             );
+            // After small changes, such as rebuilding one binary, import only
+            // files whose bytes changed on top of the retained snapshot.
+            let overlay = staging.path().join("overlay");
+            let base = match &previous {
+                Some(stamp) if self.overlay_base(root, stamp)? => {
+                    let previous_files = &stamp.files;
+                    stage_overlay(checkout, &overlay, previous_files, &files)?
+                        .then(|| stamp.imports.clone())
+                }
+                _ => None,
+            };
             self.track_native_root(&native_root, None)?;
-            self.client()?.import(&native_root, checkout.to_owned())?;
+            let merge = base.is_some();
+            if let Some(base) = base {
+                self.client()?.import(&native_root, overlay)?;
+                imports.extend(base);
+                timestamps.complete = true;
+            } else {
+                self.client()?.import(&native_root, checkout.to_owned())?;
+            }
             imports.push(NativeRestore {
                 importer: "filesystem".into(),
                 root: native_root,
@@ -324,6 +348,7 @@ impl CasitaArtifactStorage {
                     source: PathBuf::new(),
                     destination: PathBuf::new(),
                 }],
+                merge,
             });
         }
         match native {
@@ -482,6 +507,21 @@ impl CasitaArtifactStorage {
         Ok(())
     }
 
+    /// Whether a changed snapshot can be imported as an overlay of `stamp`.
+    fn overlay_base(&self, root: &str, stamp: &SnapshotStamp) -> CargoResult<bool> {
+        let Some((base, overlays)) = stamp.imports.split_first() else {
+            return Ok(false);
+        };
+        let eligible = !stamp.files.is_empty()
+            && !base.merge
+            && overlays.len() < MAX_SNAPSHOT_OVERLAYS
+            && stamp
+                .imports
+                .iter()
+                .all(|import| import.importer == "filesystem");
+        Ok(eligible && self.stamp_is_live(root, stamp)?)
+    }
+
     fn write_stamp(path: &Path, stamp: &SnapshotStamp) -> CargoResult<()> {
         let mut file = tempfile::NamedTempFile::new_in(path.parent().unwrap())?;
         serde_json::to_writer(file.as_file_mut(), stamp)?;
@@ -638,6 +678,7 @@ impl CasitaArtifactStorage {
             importer: importer.to_owned(),
             root: root.to_owned(),
             paths,
+            merge: false,
         }))
     }
 
@@ -1343,14 +1384,18 @@ enum NativeSource<'a> {
     Tar { archive: PathBuf, package: &'a str },
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct NativeRestore {
     importer: String,
     root: String,
     paths: Vec<NativePath>,
+    /// Merges into the restored tree instead of replacing it. Older Cargo
+    /// ignores this and fails to restore, rather than restoring stale files.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    merge: bool,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct NativePath {
     source: PathBuf,
     destination: PathBuf,
@@ -1371,6 +1416,86 @@ fn safe_snapshot_path(base: &Path, relative: &Path) -> CargoResult<PathBuf> {
         path.push(component);
     }
     Ok(path)
+}
+
+/// Stages the files of `source` whose bytes differ from `previous`, along with
+/// every directory and symlink. Returns false when most bytes changed, as
+/// a full import is then no more expensive and resets the overlay chain.
+fn stage_overlay(
+    source: &Path,
+    overlay: &Path,
+    previous: &BTreeMap<String, CachedFileDigest>,
+    current: &BTreeMap<String, CachedFileDigest>,
+) -> CargoResult<bool> {
+    let mut total_bytes = 0u64;
+    let mut changed_bytes = 0u64;
+    for entry in walkdir::WalkDir::new(source) {
+        let entry = entry?;
+        let relative = entry.path().strip_prefix(source)?;
+        let destination = overlay.join(relative);
+        let file_type = entry.file_type();
+        if file_type.is_dir() {
+            std::fs::create_dir(&destination)?;
+        } else if file_type.is_symlink() {
+            let target = std::fs::read_link(entry.path())?;
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(target, &destination)?;
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::FileTypeExt as _;
+                if file_type.is_symlink_dir() {
+                    std::os::windows::fs::symlink_dir(target, &destination)?;
+                } else {
+                    std::os::windows::fs::symlink_file(target, &destination)?;
+                }
+            }
+        } else if file_type.is_file() {
+            let len = entry.metadata()?.len();
+            total_bytes = total_bytes.saturating_add(len);
+            let key = SnapshotTimestamps::path_key(relative);
+            let digest = |files: &BTreeMap<String, CachedFileDigest>| {
+                files.get(&key).map(|cached| cached.digest.clone())
+            };
+            if digest(current).is_none() || digest(current) != digest(previous) {
+                changed_bytes = changed_bytes.saturating_add(len);
+                if std::fs::hard_link(entry.path(), &destination).is_err() {
+                    std::fs::copy(entry.path(), &destination)?;
+                }
+            }
+        }
+    }
+    Ok(changed_bytes.saturating_mul(2) <= total_bytes)
+}
+
+/// Moves an overlay into a restored tree, replacing entries it contains.
+fn merge_tree(overlay: &Path, data: &Path) -> CargoResult<()> {
+    // Collect first: moving files out of a directory being read is unspecified.
+    let entries = walkdir::WalkDir::new(overlay)
+        .min_depth(1)
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+    for entry in entries {
+        let destination = safe_snapshot_path(data, entry.path().strip_prefix(overlay)?)?;
+        let existing = std::fs::symlink_metadata(&destination).ok();
+        if entry.file_type().is_dir() {
+            match existing {
+                Some(metadata) if metadata.is_dir() => {}
+                Some(_) => {
+                    std::fs::remove_file(&destination)?;
+                    std::fs::create_dir(&destination)?;
+                }
+                None => std::fs::create_dir(&destination)?,
+            }
+            continue;
+        }
+        match existing {
+            Some(metadata) if metadata.is_dir() => std::fs::remove_dir_all(&destination)?,
+            Some(_) => std::fs::remove_file(&destination)?,
+            None => {}
+        }
+        std::fs::rename(entry.path(), &destination)?;
+    }
+    Ok(())
 }
 
 fn file_digest(path: &Path) -> CargoResult<String> {
@@ -1526,6 +1651,10 @@ struct SnapshotTimestamps {
     entries: BTreeMap<String, ModificationTime>,
     #[serde(default)]
     hardlinks: BTreeMap<String, String>,
+    /// `entries` lists every path in the snapshot. Restoration removes other
+    /// paths, which overlays retain from earlier generations.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    complete: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1639,6 +1768,26 @@ impl SnapshotTimestamps {
         // An absent source is stored as an empty snapshot, without a root timestamp.
         if self.entries.is_empty() && std::fs::read_dir(data)?.next().transpose()?.is_none() {
             return Ok(());
+        }
+        if self.complete {
+            for entry in walkdir::WalkDir::new(data)
+                .min_depth(1)
+                .contents_first(true)
+            {
+                let entry = entry?;
+                if self
+                    .entries
+                    .contains_key(&Self::path_key(entry.path().strip_prefix(data)?))
+                {
+                    continue;
+                }
+                if entry.file_type().is_dir() {
+                    // Contents were visited, and removed, first.
+                    std::fs::remove_dir(entry.path())?;
+                } else {
+                    std::fs::remove_file(entry.path())?;
+                }
+            }
         }
         // Restore relationships before directory timestamps. Cargo otherwise
         // relinks lifted outputs and makes an unchanged target look modified.
