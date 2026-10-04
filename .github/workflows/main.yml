@@ -96,7 +96,7 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
         with:
           repository: cachix/casita
-          ref: 9cf352ad6af80b260c141f4e76317b1f5884b1f3
+          ref: 7c11a8076d2ea0991167cd1d3451ae2f7f1beacb
           path: casita-source
       - name: Build Casita
         run: |
