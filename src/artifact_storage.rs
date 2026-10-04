@@ -82,6 +82,16 @@ pub(crate) trait ArtifactStorage {
 
     /// Whether Cargo's global-cache tracker owns this backend's artifacts.
     fn participates_in_global_cache(&self) -> bool;
+
+    /// Starts a scope in which registry and dependency persistence may be
+    /// batched. Scopes nest; only the outermost one persists.
+    fn defer_persistence(&self) {}
+
+    /// Ends a deferral scope. The outermost scope persists every request made
+    /// within it.
+    fn finish_deferred_persistence(&self) -> CargoResult<()> {
+        Ok(())
+    }
 }
 
 /// Cargo's historical on-disk artifact layout.

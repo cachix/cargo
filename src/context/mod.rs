@@ -305,6 +305,38 @@ pub struct GlobalContext {
     deferred_global_last_use: OnceLock<Mutex<DeferredGlobalLastUse>>,
 }
 
+/// Scope returned by [`GlobalContext::defer_artifact_persistence`].
+///
+/// Dropping an unfinished scope persists anyway, so artifacts written before
+/// an error are not lost.
+pub(crate) struct DeferredPersistence<'gctx> {
+    gctx: &'gctx GlobalContext,
+    finished: bool,
+}
+
+impl DeferredPersistence<'_> {
+    /// Persists deferred artifacts before returning.
+    pub(crate) fn finish(mut self) -> CargoResult<()> {
+        self.finished = true;
+        self.gctx.artifact_storage()?.finish_deferred_persistence()
+    }
+}
+
+impl Drop for DeferredPersistence<'_> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let result = self
+            .gctx
+            .artifact_storage()
+            .and_then(|storage| storage.finish_deferred_persistence());
+        if let Err(error) = result {
+            tracing::warn!("could not persist deferred artifacts: {error:#}");
+        }
+    }
+}
+
 impl GlobalContext {
     /// Creates a new config instance.
     ///
@@ -606,6 +638,17 @@ impl GlobalContext {
     /// Returns whether Cargo's global-cache tracker owns stored artifacts.
     pub(crate) fn artifacts_use_global_cache(&self) -> CargoResult<bool> {
         Ok(self.artifact_storage()?.participates_in_global_cache())
+    }
+
+    /// Batches registry and dependency persistence until the returned scope
+    /// finishes. Must be held within the package cache lock scope that
+    /// writes those artifacts.
+    pub(crate) fn defer_artifact_persistence(&self) -> CargoResult<DeferredPersistence<'_>> {
+        self.artifact_storage()?.defer_persistence();
+        Ok(DeferredPersistence {
+            gctx: self,
+            finished: false,
+        })
     }
 
     /// Gets the Cargo registry source directory (`<cargo_home>/registry/src`).

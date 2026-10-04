@@ -416,6 +416,8 @@ pub fn resolve_with_previous<'gctx>(
     let _lock = ws
         .gctx()
         .acquire_package_cache_lock(CacheLockMode::DownloadExclusive)?;
+    // Persist the registry index once, not after every query.
+    let persistence = ws.gctx().defer_artifact_persistence()?;
 
     // Some packages are already loaded when setting up a workspace. This
     // makes it so anything that was already loaded will not be loaded again.
@@ -529,6 +531,8 @@ pub fn resolve_with_previous<'gctx>(
     let gctx = ws.gctx();
     let mut deferred = gctx.deferred_global_last_use()?;
     deferred.save_no_error(gctx);
+    drop(deferred);
+    persistence.finish()?;
     Ok(resolved)
 }
 

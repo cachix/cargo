@@ -862,6 +862,63 @@ impl CasitaArtifactStorage {
         )
     }
 
+    fn with_deferred<T>(&self, f: impl FnOnce(&mut DeferredPersistence) -> T) -> T {
+        // Storage handles are created per request; the queue belongs to the repository.
+        static DEFERRED: Mutex<BTreeMap<PathBuf, DeferredPersistence>> =
+            Mutex::new(BTreeMap::new());
+        let mut deferred = DEFERRED.lock().unwrap();
+        f(deferred.entry(self.repository.clone()).or_default())
+    }
+
+    /// Queues a request if a deferral scope is open. Repeated requests for
+    /// one root collapse into a single import of its final contents.
+    fn defer(&self, root: &str, request: DeferredRequest) -> bool {
+        self.with_deferred(|deferred| {
+            if deferred.depth == 0 {
+                return false;
+            }
+            deferred.requests.insert(root.to_owned(), request);
+            true
+        })
+    }
+
+    fn persist_requests(&self, requests: BTreeMap<String, DeferredRequest>) -> CargoResult<()> {
+        for request in requests.into_values() {
+            match request {
+                DeferredRequest::Archive { key, path } => {
+                    let _lock = self.lock_repository()?;
+                    self.persist_archive_locked(&key, &path)?;
+                }
+                DeferredRequest::Dependency {
+                    cache,
+                    key,
+                    directory,
+                } => self.persist_dependency_now(cache, &key, &directory)?,
+            }
+        }
+        Ok(())
+    }
+
+    fn persist_dependency_now(
+        &self,
+        cache: DependencyCache,
+        key: &str,
+        directory: &Filesystem,
+    ) -> CargoResult<()> {
+        let native = if matches!(cache, DependencyCache::RegistrySource) {
+            key.rsplit_once('/').map(|(_, package)| NativeSource::Tar {
+                archive: self
+                    .registry_archive_dir()
+                    .as_path_unlocked()
+                    .join(format!("{key}.crate")),
+                package,
+            })
+        } else {
+            None
+        };
+        self.import_snapshot(&Self::dependency_root(cache, key), directory, native)
+    }
+
     fn client(&self) -> CargoResult<CasitaClient> {
         #[cfg(unix)]
         {
@@ -1105,6 +1162,13 @@ impl ArtifactStorage for CasitaArtifactStorage {
     }
 
     fn persist_registry_archive(&self, key: &str, path: &Path) -> CargoResult<()> {
+        let request = DeferredRequest::Archive {
+            key: key.to_owned(),
+            path: path.to_owned(),
+        };
+        if self.defer(&format!("cargo/registry/archive/{key}"), request) {
+            return Ok(());
+        }
         let _lock = self.lock_repository()?;
         self.persist_archive_locked(key, path)
     }
@@ -1124,18 +1188,15 @@ impl ArtifactStorage for CasitaArtifactStorage {
         key: &str,
         directory: &Filesystem,
     ) -> CargoResult<()> {
-        let native = if matches!(cache, DependencyCache::RegistrySource) {
-            key.rsplit_once('/').map(|(_, package)| NativeSource::Tar {
-                archive: self
-                    .registry_archive_dir()
-                    .as_path_unlocked()
-                    .join(format!("{key}.crate")),
-                package,
-            })
-        } else {
-            None
+        let request = DeferredRequest::Dependency {
+            cache,
+            key: key.to_owned(),
+            directory: directory.clone(),
         };
-        self.import_snapshot(&Self::dependency_root(cache, key), directory, native)
+        if self.defer(&Self::dependency_root(cache, key), request) {
+            return Ok(());
+        }
+        self.persist_dependency_now(cache, key, directory)
     }
 
     fn persist_git_database(
@@ -1187,6 +1248,41 @@ impl ArtifactStorage for CasitaArtifactStorage {
     fn participates_in_global_cache(&self) -> bool {
         false
     }
+
+    fn defer_persistence(&self) {
+        self.with_deferred(|deferred| deferred.depth += 1);
+    }
+
+    fn finish_deferred_persistence(&self) -> CargoResult<()> {
+        let requests = self.with_deferred(|deferred| {
+            deferred.depth = deferred.depth.saturating_sub(1);
+            if deferred.depth == 0 {
+                std::mem::take(&mut deferred.requests)
+            } else {
+                BTreeMap::new()
+            }
+        });
+        self.persist_requests(requests)
+    }
+}
+
+#[derive(Default)]
+struct DeferredPersistence {
+    depth: usize,
+    /// Requests keyed by Casita root.
+    requests: BTreeMap<String, DeferredRequest>,
+}
+
+enum DeferredRequest {
+    Archive {
+        key: String,
+        path: PathBuf,
+    },
+    Dependency {
+        cache: DependencyCache,
+        key: String,
+        directory: Filesystem,
+    },
 }
 
 enum NativeSource<'a> {

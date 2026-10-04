@@ -203,6 +203,60 @@ fn casita_storage_routes_registry_and_build_artifacts() {
 }
 
 #[cargo_test]
+fn casita_storage_persists_sparse_index_once_per_resolve() {
+    if !crate::casita_available() {
+        return;
+    }
+
+    let _server = setup_http();
+    Package::new("baz", "0.0.1").publish();
+    Package::new("qux", "0.0.1").publish();
+    Package::new("bar", "0.0.1")
+        .dep("baz", "0.0.1")
+        .dep("qux", "0.0.1")
+        .publish();
+    let p = project()
+        .file(
+            "Cargo.toml",
+            &format!(
+                "{}\n[dependencies]\nbar = \"0.0.1\"",
+                basic_manifest("foo", "0.0.1")
+            ),
+        )
+        .file("src/main.rs", "fn main() {}")
+        .file(".cargo/config.toml", "[cache]\nstorage = \"casita\"\n")
+        .build();
+
+    let casita_data = tempfile::tempdir_in(paths::root()).unwrap();
+    let output = p
+        .cargo("build -Zcasita-storage")
+        .masquerade_as_nightly_cargo(&["casita-storage"])
+        .env("XDG_DATA_HOME", casita_data.path())
+        .env("CARGO_LOG", "cargo::context::casita=debug")
+        .exec_with_output()
+        .unwrap();
+    let diagnostics = String::from_utf8(output.stderr).unwrap();
+    let index_imports = diagnostics
+        .lines()
+        .filter(|line| line.contains("operation=\"snapshot.import\" root=\"cargo/registry/index/"))
+        .count();
+    assert_eq!(index_imports, 1, "{diagnostics}");
+
+    // Deferred artifacts must still be restorable offline.
+    remove_dir_all(paths::cargo_home().join("registry")).unwrap();
+    p.cargo("clean -Zcasita-storage")
+        .masquerade_as_nightly_cargo(&["casita-storage"])
+        .env("XDG_DATA_HOME", casita_data.path())
+        .run();
+    p.cargo("build --offline -Zcasita-storage")
+        .masquerade_as_nightly_cargo(&["casita-storage"])
+        .env("XDG_DATA_HOME", casita_data.path())
+        .with_stderr_contains("[COMPILING] baz v0.0.1")
+        .with_stderr_contains("[COMPILING] foo v0.0.1 ([ROOT]/foo)")
+        .run();
+}
+
+#[cargo_test]
 #[cfg(unix)]
 fn casita_storage_preserves_precise_timestamps() {
     use filetime::{FileTime, set_file_mtime, set_symlink_file_times};
